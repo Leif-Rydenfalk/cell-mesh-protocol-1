@@ -312,17 +312,29 @@ impl NarrativeStep {
 }
 
 /// Entry in the mesh atlas (directory)
+fn default_first_seen() -> u64 {
+    now_millis()
+}
+
+fn default_status() -> String {
+    "online".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AtlasEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>, // ← CHANGED FROM String TO Option<String>
+    pub id: Option<String>,
     pub addr: String,
     pub caps: Vec<String>,
     pub pub_key: String,
+    #[serde(default = "default_first_seen")]
+    pub first_seen: u64,     // <-- NEW
     pub last_seen: u64,
     pub last_gossiped: u64,
     pub gossip_hop_count: u8,
+    #[serde(default = "default_status")]
+    pub status: String,      // <-- NEW
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -337,9 +349,11 @@ impl AtlasEntry {
             addr: addr.into(),
             caps,
             pub_key: String::new(),
+            first_seen: now,
             last_seen: now,
             last_gossiped: now,
             gossip_hop_count: 0,
+            status: "online".to_string(),
             metadata: None,
             latency_ms: None,
         }
@@ -1103,22 +1117,33 @@ impl RheoCell {
 
     async fn cleanup(&self) {
         let now = Instant::now();
-        let _ttl = Duration::from_millis(self.config.atlas_ttl_ms);
+        let current_time = now_millis();
 
-        // Clean old atlas entries
-        let to_remove: Vec<String> = self
-            .atlas
-            .iter()
-            .filter(|e| {
-                e.key() != &self.id
-                    && now.duration_since(Instant::now()).as_millis() as u64 + e.value().last_seen
-                        < now_millis()
-            })
-            .map(|e| e.key().clone())
-            .collect();
+        // Mark stale entries as offline instead of deleting
+        for mut entry in self.atlas.iter_mut() {
+            if entry.key() != &self.id {
+                if current_time.saturating_sub(entry.value().last_seen) > self.config.atlas_ttl_ms {
+                    if entry.value().status != "offline" {
+                        entry.value_mut().status = "offline".to_string();
+                        debug!("💤 Marked stale cell as offline: {}", entry.key());
+                    }
+                }
+            }
+        }
 
-        for id in to_remove {
-            self.atlas.remove(&id);
+        // Periodically rescan the global file registry (Poor man's fs.watch for Rust)
+        if let Ok(mut dir) = tokio::fs::read_dir(get_registry_dir()).await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+                    if let Ok(mut atlas_entry) = serde_json::from_str::<AtlasEntry>(&content) {
+                        atlas_entry.status = "online".to_string();
+                        atlas_entry.last_seen = current_time;
+                        let mut map = HashMap::new();
+                        map.insert(atlas_entry.id.clone().unwrap_or_default(), atlas_entry);
+                        self.merge_atlas(map, false);
+                    }
+                }
+            }
         }
 
         // Clean old nonces
