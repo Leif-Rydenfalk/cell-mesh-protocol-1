@@ -1,0 +1,15 @@
+{
+  "name": "cell-mesh-protocol-1",
+  "version": "1.0.0",
+  "description": "Narrative Transparent Substrate (NTS-1) Mesh Protocol",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "bun-types": "^1.3.9"
+  }
+}

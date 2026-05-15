@@ -1,0 +1,30 @@
+{
+    "compilerOptions": {
+        "target": "ESNext",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "strict": true,
+        "skipLibCheck": true,
+        "allowJs": true,
+        "esModuleInterop": true,
+        "allowSyntheticDefaultImports": true,
+        "forceConsistentCasingInFileNames": true,
+        "types": [
+            "bun-types"
+        ],
+        "paths": {
+            "./protocols/example1/*": [
+                "./protocols/example1/*"
+            ]
+        }
+    },
+    "include": [
+        "**/*.ts",
+        "mesh-types.d.ts"
+    ],
+    "exclude": [
+        "node_modules",
+        "**/data/**",
+        "ai_workspace"
+    ]
+}

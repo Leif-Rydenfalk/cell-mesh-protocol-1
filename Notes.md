@@ -1,0 +1,1 @@
+dont overcomplicate this. i choose typescript because its quick and dirty. Whats the first thing you would change in example2 to move towards the mesh system with scalability potential reaching millions of cells?

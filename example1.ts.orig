@@ -1,0 +1,1839 @@
+// cdk.ts - The Sovereign Substrate for the Rheo Living Mesh
+// Pattern: Narrative Transparent Substrate (NTS-1)
+const bunServe = (globalThis as any).Bun?.serve;
+import { createServer } from "node:http";
+
+import {
+    randomUUID,
+    createHash,
+    generateKeyPairSync,
+    sign,
+    verify,
+    createPublicKey
+} from "node:crypto";
+import {
+    writeFileSync,
+    readFileSync,
+    existsSync,
+    mkdirSync,
+    statSync,
+    readdirSync,
+    unlinkSync
+} from "node:fs";
+import { join, dirname, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { loadavg } from "node:os";
+
+const currentDir = dirname(new URL(import.meta.url).pathname);
+const cellsRoot = resolve(currentDir, ".."); // ../ from app/
+const REGISTRY_DIR = join(cellsRoot, ".rheo", "registry");
+if (!existsSync(REGISTRY_DIR)) mkdirSync(REGISTRY_DIR, { recursive: true });
+
+
+// --- TYPES & INTERFACES ---
+
+/**
+ * NarrativeStep: A single "Black Box" recording of a cell action.
+ * Used to construct the causality chain during mesh failures.
+ */
+export interface NarrativeStep {
+    cell: string;
+    timestamp: number;
+    action: string;
+    data?: any;
+}
+
+export interface AtlasEntry {
+    id?: string;  // the cell's self-reported ID
+    addr: string;
+    caps: string[];
+    pubKey: string;     // Cryptographic Identity for Vouch Verification
+    lastSeen: number;        // When WE last heard from this cell directly
+    lastGossiped: number;    // When we last forwarded this entry
+    gossipHopCount: number;  // How many hops from source (for TTL)
+}
+
+export interface TraceError {
+    code: string;
+    msg: string;
+    from: string;
+    trace: string[];
+    history?: NarrativeStep[]; // The evidence chain of how we reached this error
+    details?: any;
+}
+
+export interface TraceResult {
+    ok: boolean;
+    value?: any;
+    error?: TraceError;
+    cid: string;
+}
+
+export type TransportMode = 'server' | 'client';
+
+/**
+ * Signal: The Extensible Envelope.
+ * 
+ * TRANSPARENCY: [key: string]: any ensures that if a signal contains 
+ * fields from a different CDK implementation (e.g. quantum_sigs), 
+ * this cell passes those exact bytes forward untouched.
+ */
+export interface Signal {
+    id: string;
+    from: string;
+    intent: "ASK" | "TELL";
+    payload: { capability: string; args: any;[key: string]: any };
+    proofs: Record<string, string>;
+    atlas: Record<string, AtlasEntry>;
+    trace: string[];
+    _steps?: NarrativeStep[]; // Narrative Black Box recorder
+    _visitedCellIds?: string[];  // Which cells have processed this (by ID)
+    _visitedAddr?: string[]; // Track visited addresses for debugging
+    _hops?: number;
+    [key: string]: any;
+}
+
+export interface Contract {
+    capability: string;
+    version: string;
+    inputSchema?: any;
+    outputSchema?: any;
+    transport: { protocol: string; port?: number; adapters: any[] };
+    machine?: any;
+    compatibility: string[];
+}
+
+export interface CellManifest {
+    pid: number;
+    version: string;
+    port: number;
+    startTime: number;
+    capabilities: string[];
+    seed?: string;
+    pubKey: string;
+}
+
+// --- ENHANCED ERROR SYSTEM ---
+
+/**
+ * MeshError: Rich diagnostic exception for mesh failures.
+ * Provides full narrative history, signal context, and debugging information.
+ */
+export class MeshError extends Error {
+    public readonly timestamp: string;
+    public readonly signalId: string;
+    public readonly failedAt: string;
+    public readonly errorChain: string[];
+
+    constructor(public error: TraceError, public cid: string) {
+        const timestamp = new Date().toISOString();
+        const errorChain = MeshError.buildErrorChain(error);
+
+        super(MeshError.formatMessage(error, cid, timestamp, errorChain));
+
+        this.name = "MeshError";
+        this.timestamp = timestamp;
+        this.signalId = cid;
+        this.failedAt = error.from;
+        this.errorChain = errorChain;
+
+        if (Error.captureStackTrace) {
+            Error.captureStackTrace(this, MeshError);
+        }
+    }
+
+    private static buildErrorChain(error: TraceError): string[] {
+        const chain: string[] = [];
+        if (error.history) {
+            // We only care about steps where things went wrong to keep the summary concise
+            const failures = error.history.filter(s =>
+                s.action.includes("FAIL") ||
+                s.action.includes("ERROR") ||
+                s.action.includes("TIMEOUT") ||
+                s.action.includes("REJECTED")
+            );
+
+            for (const f of failures) {
+                // FIX: Add safety check for timestamp
+                const time = f.timestamp ? new Date(f.timestamp).toISOString().split('T')[1].replace('Z', '') : 'unknown';
+
+                // PROTECT: This is where circular/cyclic structures usually crash JSON.stringify
+                let dataSummary = "";
+                if (f.data) {
+                    try {
+                        // Try a strict stringify first for accuracy
+                        const str = JSON.stringify(f.data);
+                        dataSummary = str.length > 120 ? str.substring(0, 120) + "..." : str;
+                    } catch (e) {
+                        // FALLBACK: If data is cyclic (like a Signal containing itself), 
+                        // we extract top-level keys manually to avoid the crash.
+                        const keys = Object.keys(f.data).join(', ');
+                        dataSummary = `[Cyclic Object Keys: ${keys}]`;
+                    }
+                }
+
+                chain.push(`[${time}] ${f.cell}: ${f.action} | Data: ${dataSummary}`);
+            }
+        }
+        return chain;
+    }
+
+    // private static buildErrorChain(error: TraceError): string[] {
+    //     const chain: string[] = [];
+    //     if (error.history) {
+    //         // Build timeline of failures
+    //         const failures = error.history.filter(s =>
+    //             s.action.includes("FAIL") ||
+    //             s.action.includes("ERR") ||
+    //             s.action.includes("TIMEOUT")
+    //         );
+    //         for (const f of failures) {
+    //             const time = new Date(f.timestamp).toISOString().split('T')[1].replace('Z', '');
+    //             const data = f.data ? ` | Data: ${JSON.stringify(f.data).substring(0, 100)}` : '';
+    //             chain.push(`[${time}] ${f.cell}: ${f.action}${data}`);
+    //         }
+    //     }
+    //     return chain;
+    // }
+
+    private static formatMessage(error: TraceError, cid: string, timestamp: string, chain: string[]): string {
+        const lines: string[] = [];
+        lines.push(`\n${'='.repeat(60)}`);
+        lines.push(`💥 MESH FAILURE [${error.code}]`);
+        lines.push(`${'='.repeat(60)}`);
+        lines.push(`Time:     ${timestamp}`);
+        lines.push(`Signal:   ${cid}`);
+        lines.push(`Failed At: ${error.from}`);
+        lines.push(`Message:  ${error.msg}`);
+
+        if (error.trace && error.trace.length > 0) {
+            lines.push(`\n📍 Signal Path (${error.trace.length} hops):`);
+            error.trace.forEach((hop, i) => {
+                const [cellId, time] = hop.split(':');
+                const timeStr = time ? new Date(parseInt(time)).toISOString().split('T')[1].replace('Z', '') : 'unknown';
+                lines.push(`   ${i + 1}. ${cellId} @ ${timeStr}`);
+            });
+        }
+
+        if (chain.length > 0) {
+            lines.push(`\n🔥 Failure Chain:`);
+            chain.forEach(c => lines.push(`   ${c}`));
+        }
+
+        if (error.history && error.history.length > 0) {
+            lines.push(`\n📜 Full Narrative (${error.history.length} steps):`);
+            error.history.forEach((s, i) => {
+                const time = new Date(s.timestamp).toISOString().split('T')[1].replace('Z', '');
+                const dataStr = s.data ? ` | ${JSON.stringify(s.data).substring(0, 80)}` : '';
+                lines.push(`   [${time}] ${s.cell.padEnd(20)} | ${s.action.padEnd(20)}${dataStr}`);
+            });
+        }
+
+        // Suggest likely causes based on error code
+        lines.push(`\n💡 Likely Causes:`);
+        lines.push(...MeshError.suggestCauses(error));
+
+        lines.push(`${'='.repeat(60)}\n`);
+
+        return lines.join('\n');
+    }
+
+    private static suggestCauses(error: TraceError): string[] {
+        const causes: Record<string, string[]> = {
+            "LOOP": [
+                "Signal ID was reused (check for duplicate randomUUID calls)",
+                "Cell forwarded to itself (check 'from' vs 'addr' comparison in route())",
+                "Circular capability chain (A→B→C→A)",
+                "Stale Atlas entry pointing to wrong address"
+            ],
+            "HANDLER_ERR": [
+                "Capability handler threw an exception",
+                "Missing required arguments in payload",
+                "Downstream service unavailable",
+                "Check handler implementation for async errors"
+            ],
+            "NOT_FOUND": [
+                "Capability not registered in any cell",
+                "Cell hosting capability is offline",
+                "Mesh hasn't converged yet (try adding delay)",
+                "Typo in capability name",
+                "The capability was found earlier, but no cell responded to the signal.",
+                "This usually happens if the cell crashed or timed out during the hop."
+            ],
+            "RPC_FAIL": [
+                "Target cell crashed or unreachable",
+                "Network timeout (check cell health)",
+                "Port conflict or firewall issue",
+                "Target cell is shutting down"
+            ],
+            "TIMEOUT": [
+                "Operation exceeded deadline",
+                "Downstream cell is overloaded",
+                "Deadlock in capability chain",
+                "Check for infinite loops in handlers"
+            ],
+            "RPC_TIMEOUT": [
+                "The target cell (AI, Kindly, etc.) is taking too long to process.",
+                "Check if the Gemini/LLM API is responding slowly.",
+                "Consider increasing the rpc timeout in example1.ts"
+            ],
+        };
+
+        return causes[error.code] || [
+            "Unknown error type - check narrative history for clues",
+            "Verify all cells in the chain are healthy",
+            "Check for recent changes to capability implementations"
+        ];
+    }
+
+    /**
+     * Print detailed narrative to stderr
+     */
+    public printNarrative() {
+        console.error(this.message);
+    }
+
+    /**
+     * Get structured data for programmatic handling
+     */
+    public toJSON() {
+        return {
+            code: this.error.code,
+            message: this.error.msg,
+            signalId: this.cid,
+            failedAt: this.failedAt,
+            timestamp: this.timestamp,
+            trace: this.error.trace,
+            history: this.error.history,
+            errorChain: this.errorChain
+        };
+    }
+}
+
+// --- CORE RHEO CELL ---
+
+export class RheoCell {
+    public atlas: Record<string, AtlasEntry> = {};
+    private handlers: Record<string, Function> = {};
+    private contracts = new Map<string, Contract>();
+    private seenNonces = new Set<string>();
+    public server: any;
+
+    // Cryptographic Identity (Ed25519)
+    private privateKey: KeyObject;
+    public publicKey: string;
+
+    public mode: TransportMode = 'server';
+
+
+    private manifestPath: string;
+    private cellDir: string;
+    private currentVersion: string;
+    private seedFile = ".rheo_seed";
+
+    private isShuttingDown: boolean = false;
+    private activeIntervals: Timer[] = [];
+
+    private activeExecutions = new Map<string, Promise<TraceResult>>();
+    private resultCache = new Map<string, { result: TraceResult, time: number }>();
+
+    // Local Journaling (Ephemeral Memory)
+    private journal: Record<string, NarrativeStep[]> = {};
+    private rollingJournal: any[] = [];
+    private readonly MAX_JOURNAL_SIZE = 100;
+
+    private _addr: string = "";
+    public get addr(): string {
+        return this._addr;
+    }
+
+    // Telemetry State
+    private metrics = {
+        qps: 0,
+        errors: 0,
+        latencySum: 0,
+        requestCount: 0,
+        windowStart: Date.now()
+    };
+
+    /**
+ * The Segmented Capability Proxy
+ * 
+ * Logic: Translates underscores to mesh-standard dashes and maps
+ * double-underscores to recursive middleware layers.
+ * 
+ * Example: cell.mesh.inventory.add__auth_user() -> "inventory/add|auth/user"
+ */
+    get mesh(): any {
+        // Lazy initialization - create proxy on first access
+        if (!(this as any)._meshProxy) {
+            (this as any)._meshProxy = new Proxy({} as any, {
+                get: (target, namespace: string) => {
+                    return new Proxy({}, {
+                        get: (subTarget, methodCall: string) => {
+                            return async (args: any, proofs: Record<string, string> = {}) => {
+                                const [method, ...middlewares] = methodCall.split('__');
+
+                                // Standardize underscores to dashes for the primary method
+                                let capability = `${namespace}/${method.replace(/_/g, '-')}`;
+
+                                if (middlewares.length > 0) {
+                                    // inventory/add|auth/user
+                                    capability += "|" + middlewares.join('|').replace(/_/g, '/');
+                                }
+
+                                const res = await this.askMesh(capability, args, proofs);
+
+                                if (!res.ok) {
+                                    const err = new MeshError(res.error!, res.cid);
+                                    err.printNarrative();
+                                    throw err;
+                                }
+                                return res.value;
+                            };
+                        }
+                    });
+                }
+            });
+        }
+        return (this as any)._meshProxy;
+    }
+
+    // /**
+    //  * The Segmented Capability Proxy
+    //  * 
+    //  * Logic: Translates underscores to mesh-standard dashes and maps
+    //  * double-underscores to recursive middleware layers.
+    //  * 
+    //  * Example: cell.mesh.inventory.add__auth_user() -> "inventory/add|auth/user"
+    //  */
+    // public mesh = new Proxy({} as any, {
+    //     get: (target, namespace: string) => {
+    //         return new Proxy({}, {
+    //             get: (subTarget, methodCall: string) => {
+    //                 return async (args: any, proofs: Record<string, string> = {}) => {
+    //                     const [method, ...middlewares] = methodCall.split('__');
+
+    //                     // Standardize underscores to dashes for the primary method
+    //                     let capability = `${namespace}/${method.replace(/_/g, '-')}`;
+
+    //                     if (middlewares.length > 0) {
+    //                         // inventory/add|auth/user
+    //                         capability += "|" + middlewares.join('|').replace(/_/g, '/');
+    //                     }
+
+    //                     const res = await this.askMesh(capability, args, proofs);
+
+    //                     if (!res.ok) {
+    //                         const err = new MeshError(res.error!, res.cid);
+    //                         err.printNarrative();
+    //                         throw err;
+    //                     }
+    //                     return res.value;
+    //                 };
+    //             }
+    //         });
+    //     }
+    // });
+
+    constructor(public id: string, public port: number = 0, public seed?: string) {
+        if (process.env.RHEO_CELL_ID) this.id = process.env.RHEO_CELL_ID;
+
+        this.cellDir = process.cwd();
+        const manifestDir = join(cellsRoot, ".rheo", "manifests");
+        if (!existsSync(manifestDir)) mkdirSync(manifestDir, { recursive: true });
+        this.manifestPath = join(manifestDir, `${this.id}.cell.json`);
+
+        // --- IDENTITY GENERATION (Session-based Ed25519) ---
+        // Generate Identity with explicit Ed25519
+        // Remove the encoding options to get KeyObjects
+        const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+        this.privateKey = privateKey;  // This is a KeyObject
+        this.publicKey = publicKey.export({ type: 'spki', format: 'pem' });  // Export as PEM string
+
+        // Log key fingerprint for debugging
+        const pubKeyBuffer = publicKey.export({ type: 'spki', format: 'der' });
+        const fingerprint = createHash('sha256').update(pubKeyBuffer).digest('hex').substring(0, 16);
+        console.log(`[${this.id}] Key fingerprint: ${fingerprint}`);
+
+        // Only reuse port from manifest if explicitly allowed
+        const forceRandomPort = process.env.RHEO_FORCE_RANDOM_PORT === "true";
+
+        if (this.port === 0 && existsSync(this.manifestPath) && !forceRandomPort) {
+            try {
+                const manifestPort = JSON.parse(readFileSync(this.manifestPath, 'utf8')).port;
+                // Check if port is likely in use ( heuristic: if manifest is older than 30 seconds, assume stale)
+                const manifestStat = statSync(this.manifestPath);
+                const manifestAge = Date.now() - manifestStat.mtimeMs;
+                if (manifestAge < 30000) {
+                    this.port = manifestPort;
+                }
+            } catch (e) { }
+        }
+
+        this.currentVersion = this.calculateVersion();
+        this.cleanupGhostProcesses();
+
+        // --- SOVEREIGN DEFAULTS ---
+        this.provide("mesh/ping", () => "PONG");
+        this.provide("mesh/gossip", (args: { atlas: Record<string, AtlasEntry> }, ctx: any) => {
+            const hopCount = ctx?._hops || 0;
+            this.mergeAtlas(args.atlas, true, hopCount);
+
+            return {
+                atlas: this.atlas,
+                _hops: hopCount + 1
+            };
+        });
+        this.provide("cell/shutdown", this.handleShutdown.bind(this));
+        this.provide("cell/inspect", () => ({
+            id: this.id, version: this.currentVersion, metrics: this.metrics, capabilities: Object.keys(this.handlers), atlasSize: Object.keys(this.atlas).length
+        }));
+        this.provide("cell/journal", (args: { limit?: number }) => this.rollingJournal.slice(-(args.limit || 50)));
+        this.provide("mesh/directory", () => this.atlas);
+        this.provide("mesh/who", (args: { cap: string }) => Object.entries(this.atlas)
+            .filter(([_, e]) => e.caps.includes(args.cap))
+            .map(([id, e]) => ({ id, addr: e.addr, pubKey: e.pubKey })));
+
+        this.provide("mesh/signal-to-url", async (args: { url: string, payload: any }, ctx: Signal) => {
+            const urlObj = new URL(args.url);
+            const cap = urlObj.pathname.replace(/^\//, '');
+            const signal: Signal = {
+                ...ctx, id: randomUUID(), from: this.id, intent: "TELL",
+                payload: { capability: cap, args: args.payload },
+                _steps: [...(ctx._steps || []), { cell: this.id, timestamp: Date.now(), action: "EMITTING_REACTIVE_SIGNAL", data: { url: args.url } }]
+            };
+            fetch(args.url, { method: "POST", body: JSON.stringify(signal), headers: { "Content-Type": "application/json" } }).catch(() => { });
+            return { sent: true };
+        });
+
+        this.provide("cell/contract", (args: { cap: string }) => this.contracts.get(args.cap) || null);
+
+        // // If seed provided, synchronously fetch atlas before returning
+        // if (seed) {
+        //     this.bootstrapFromSeed(seed);
+        // }
+
+        // this.registerToRegistry();
+        // this.bootstrapFromRegistry().catch(() => { });
+
+        // // Heartbeat: Update registry file every 5s to stay "alive"
+        // setInterval(() => this.registerToRegistry(), 5000);
+
+        // this.log("INFO", `Sovereign Cell online @ ${this.server.port}`);
+        // this.saveManifest();
+    }
+
+    // --- DECENTRALIZED DISCOVERY ---
+
+    private registerToRegistry() {
+        if (!this.addr) return;
+        const entry: AtlasEntry = {
+            id: this.id,
+            addr: this.addr,
+            caps: Object.keys(this.handlers),
+            pubKey: this.publicKey,
+            lastSeen: Date.now(),
+            lastGossiped: Date.now(),
+            gossipHopCount: 0
+        };
+        try {
+            writeFileSync(join(REGISTRY_DIR, `${this.id}.json`), JSON.stringify(entry));
+        } catch (e) { }
+    }
+
+    private removeFromRegistry() {
+        try {
+            const file = join(REGISTRY_DIR, `${this.id}.json`);
+            if (existsSync(file)) unlinkSync(file);
+        } catch (e) { }
+    }
+
+    private pruneDeadPeer(peerId: string) {
+        // 1. Remove from local memory
+        delete this.atlas[peerId];
+        // 2. Remove from shared disk registry (Self-Healing)
+        // This stops other cells from discovering this dead peer
+        try {
+            const file = join(REGISTRY_DIR, `${peerId}.json`);
+            if (existsSync(file)) unlinkSync(file);
+        } catch (e) { }
+    }
+
+    public async bootstrapFromRegistry(forceAll = false) {
+        try {
+            // DEBUG: Log where we are looking
+            // console.log(`[${this.id}] Scanning registry at: ${REGISTRY_DIR}`);
+
+            const files = readdirSync(REGISTRY_DIR).filter(f => f.endsWith('.json') && f !== `${this.id}.json`);
+
+            // DEBUG: Log what we found
+            // if (files.length > 0) console.log(`[${this.id}] Found ${files.length} peers in registry`);
+
+            const peers = forceAll ? files : files.sort(() => 0.5 - Math.random()).slice(0, 5);
+
+            for (const file of peers) {
+                try {
+                    const content = readFileSync(join(REGISTRY_DIR, file), 'utf8');
+                    const entry: AtlasEntry = JSON.parse(content);
+
+                    if (Date.now() - entry.lastSeen < 60000) {
+                        this.mergeAtlas({ [entry.id || file.replace('.json', '')]: entry }, false, 0);
+                    } else {
+                        // DEBUG: Log stale removal
+                        // console.log(`[${this.id}] Removing stale peer: ${file}`);
+                        unlinkSync(join(REGISTRY_DIR, file));
+                    }
+                } catch (e) { }
+            }
+        } catch (e) {
+            // DEBUG: Log read errors
+            console.error(`[${this.id}] Registry scan failed: ${e}`);
+        }
+    }
+
+    // private async bootstrapFromSeed(seed: string) {
+    //     // Try 10 times with 50ms delay = 500ms max
+    //     for (let i = 0; i < 10; i++) {
+    //         try {
+    //             const res = await fetch(`${seed}/atlas`, {
+    //                 method: "POST",
+    //                 signal: AbortSignal.timeout(100)
+    //             });
+    //             if (res.ok) {
+    //                 const { atlas } = await res.json();
+    //                 this.mergeAtlas(atlas, false, 0);
+    //                 console.log(`[${this.id}] Bootstrapped ${Object.keys(atlas).length} peers from seed`);
+    //                 return;
+    //             }
+    //         } catch { }
+    //         await new Promise(r => setTimeout(r, 50));
+    //     }
+    //     console.log(`[${this.id}] Seed bootstrap failed, will converge via gossip`);
+    // }
+
+    // --- NARRATIVE METHODS ---
+
+    private addStep(cid: string, action: string, data?: any) {
+        if (!this.journal[cid]) this.journal[cid] = [];
+
+        // --- DEFENSIVE STRIPPING ---
+        // This breaks the circular reference. We record the business data 
+        // but throw away the "plumbing" headers (atlas, trace, etc) for this specific log entry.
+        let safeData = data;
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+            try {
+                // Shallow clone the data and remove recursive mesh fields
+                const { _steps, atlas, trace, _visitedCellIds, _visitedAddr, ...clean } = data;
+                safeData = clean;
+            } catch (e) {
+                safeData = "[Complex Data - Stripped]";
+            }
+        }
+
+        const step = {
+            cell: this.id,
+            timestamp: Date.now(),
+            action,
+            data: safeData
+        };
+
+        this.journal[cid].push(step);
+
+        // PRUNING: Keep history lean to prevent massive network payloads.
+        // The Ledger only needs the most relevant recent steps.
+        if (this.journal[cid].length > 40) {
+            this.journal[cid].shift();
+        }
+
+        return step;
+    }
+
+    // --- RECURSIVE PROOF METHODS ---
+
+    public signVouch(capPart: string, signalId: string): string {
+        const message = Buffer.from(`${signalId}:${capPart}`);
+        // For Ed25519, pass undefined as the digest algorithm
+        const signature = sign(undefined, message, this.privateKey);
+        return signature.toString('hex');
+    }
+
+    public verifyVouch(capPart: string, signalId: string, signatureHex: string, pemPubKey: string): boolean {
+        try {
+            const message = Buffer.from(`${signalId}:${capPart}`);
+            const signature = Buffer.from(signatureHex, 'hex');
+            const publicKey = createPublicKey(pemPubKey);
+            // For Ed25519 verification, also pass undefined
+            return verify(undefined, message, publicKey, signature);
+        } catch (e) {
+            console.error(`[verifyVouch] Error: ${e}`);
+            return false;
+        }
+    }
+
+    // --- LIFECYCLE & TELEMETRY ---
+
+    public log(level: "INFO" | "WARN" | "ERROR", msg: string, cid?: string) {
+        const timestamp = new Date().toISOString().split('T')[1].split('Z')[0];
+        const colors = { INFO: "\x1b[32m", WARN: "\x1b[33m", ERROR: "\x1b[31m" };
+        console.log(`${colors[level]}[${timestamp}] [${level}] [${this.id}]${cid ? ` [${cid.substring(0, 8)}]` : ""} ${msg}\x1b[0m`);
+    }
+
+    private updateMetrics(duration: number, isError: boolean) {
+        const now = Date.now();
+        if (now - this.metrics.windowStart > 5000) {
+            this.metrics.qps = this.metrics.requestCount / 5;
+            this.metrics.requestCount = 0; this.metrics.errors = 0; this.metrics.latencySum = 0;
+            this.metrics.windowStart = now;
+        }
+        this.metrics.requestCount++; this.metrics.latencySum += duration;
+        if (isError) this.metrics.errors++;
+    }
+
+    private calculateVersion(): string {
+        try {
+            const hash = createHash('sha256');
+            hash.update(readFileSync(new URL(import.meta.url).pathname));
+            return hash.digest('hex').substring(0, 16);
+        } catch (e) { return `v_${Date.now()}`; }
+    }
+
+    private cleanupGhostProcesses() {
+        if (!existsSync(this.manifestPath)) return;
+        try {
+            const m = JSON.parse(readFileSync(this.manifestPath, 'utf8'));
+            if (m.pid && m.pid !== process.pid) process.kill(m.pid, 'SIGKILL');
+        } catch (e) { }
+    }
+
+    private saveManifest() {
+        if (this.isShuttingDown) return;
+        const manifest: CellManifest = {
+            pid: process.pid, version: this.currentVersion, port: this.server?.port || this.port,
+            startTime: Date.now(), capabilities: Object.keys(this.handlers), seed: this.seed, pubKey: this.publicKey
+        };
+        if (!existsSync(dirname(this.manifestPath))) mkdirSync(dirname(this.manifestPath), { recursive: true });
+        writeFileSync(this.manifestPath, JSON.stringify(manifest, null, 2));
+    }
+
+    public handleShutdown(): TraceResult {
+        if (this.isShuttingDown) return { ok: true, cid: randomUUID() };
+        this.isShuttingDown = true;
+        this.removeFromRegistry();
+        this.activeIntervals.forEach(clearInterval);
+        this.log("WARN", "Extinguishing cell...");
+        if (this.server) this.server.stop();
+        setTimeout(() => process.exit(0), 200);
+        return { ok: true, value: { status: "extinguishing" }, cid: randomUUID() };
+    }
+
+    public provide(capability: string, handler: Function) {
+        this.handlers[capability] = handler;
+        this.saveManifest();
+    }
+
+    public provideContract<I, O>(
+        contract: Contract,
+        handler: (args: I, ctx: Signal) => Promise<O>
+    ) {
+        this.contracts.set(contract.capability, contract);
+
+        // Här skulle vi kunna lägga till runtime-validering mot contract.inputSchema
+        // För nu kör vi "trust but verify" via TypeScript
+        this.provide(contract.capability, handler);
+    }
+
+    // --- MESH COMMUNICATIONS ---
+
+    public async askMesh(capability: string, args: any = {}, proofs: Record<string, string> = {}): Promise<TraceResult> {
+        const signal: Signal = {
+            id: randomUUID(), from: this.id, intent: "ASK", payload: { capability, args },
+            proofs, atlas: this.atlas, trace: [], _steps: []
+        };
+        return this.route(signal);
+    }
+
+    private requestQueue = new Map<string, Promise<TraceResult>>();
+    private maxConcurrent = 50;
+
+    /**
+     * The Logic Engine of the Cell.
+     * Responsibility: Deduplication, Loop Prevention, Narrative Tracking, and Execution.
+     */
+    private async route(signal: Signal): Promise<TraceResult> {
+        while (this.activeExecutions.size >= this.maxConcurrent) {
+            await new Promise(r => setTimeout(r, 10));
+        }
+
+        const cid = signal.id;
+        const myId = this.id;
+        const cap = signal.payload.capability;
+
+        // CLIENT MODE: Can forward but not handle unless explicitly provided
+        if (!this.addr && this.mode === 'server' && this.handlers[cap]) {
+            return { ok: false, cid, error: { code: "NOT_READY", msg: "Cell has no address - cannot handle local capabilities", from: myId, trace: [] } };
+        }
+
+        // --- 1. RESULT CACHE (Idempotency) ---
+        // If we already finished this work recently, return the exact same result.
+        if (this.resultCache.has(cid)) {
+            return this.resultCache.get(cid)!.result;
+        }
+
+        // --- 2. REQUEST JOINING (Deduplication) ---
+        // If we are currently working on this ID, don't start a new execution.
+        // Return the Promise of the one already running.
+        if (this.activeExecutions.has(cid)) {
+            // this.log("DEBUG", `🪢  Joining existing execution for signal ${cid.substring(0,8)}`);
+            return this.activeExecutions.get(cid)!;
+        }
+
+        // --- 3. LOOP PREVENTION ---
+        const visitedIds = signal._visitedCellIds || [];
+        if (visitedIds.includes(myId)) {
+            return { ok: false, cid, error: { code: "LOOP", msg: "Loop detected", from: myId, trace: signal.trace } };
+        }
+
+        // --- 4. EXECUTION WRAPPER ---
+        // We create a promise that represents the work.
+        const executionPromise = (async (): Promise<TraceResult> => {
+            visitedIds.push(myId);
+
+            if (!this.journal[cid]) this.journal[cid] = (signal._steps || []).slice(-20);
+            this.addStep(cid, "RECEIVED_SIGNAL", { capability: cap });
+            if (cap !== 'mesh/gossip' && cap !== 'cell/contract') {
+                if(cap!=="mesh/gossip"&&cap!=="cell/contract")if(cap!=="mesh/gossip"&&cap!=="cell/contract")if(cap!=="mesh/gossip"&&cap!=="cell/contract")if (cap !== "mesh/gossip" && cap !== "cell/contract") if (cap !== "mesh/gossip" && cap !== "cell/contract") this.log("INFO", `📥 SIGNAL_ARRIVED: [${cap}] from [${signal.from}]`, cid);
+            }
+
+            const updatedSignal: Signal = {
+                ...signal,
+                _visitedCellIds: visitedIds,
+                _visitedAddr: [...(signal._visitedAddr || []), this.addr],
+                trace: [...(signal.trace || []), `${myId}:${Date.now()}`],
+                atlas: { ...this.atlas, ...(signal.atlas || {}) },
+                _steps: this.journal[cid],
+                _hops: (signal._hops || 0) + 1
+            };
+
+            let result: TraceResult;
+            const startTime = performance.now();
+
+            try {
+                if (this.handlers[cap]) {
+                    this.addStep(cid, "LOCAL_HANDLER", { capability: cap });
+                    const val = await this.handlers[cap](updatedSignal.payload.args, updatedSignal);
+                    result = { ok: true, value: val, cid };
+                } else {
+                    result = await this.forwardToPeer(updatedSignal, cap, cid);
+                }
+            } catch (e: any) {
+                result = { ok: false, cid, error: { code: "HANDLER_ERR", msg: e.message, from: myId, trace: updatedSignal.trace, history: this.journal[cid] } };
+            }
+
+            this.updateMetrics(performance.now() - startTime, !result.ok);
+
+            // Move from "Active" to "Recent Cache"
+            this.resultCache.set(cid, { result, time: Date.now() });
+            this.activeExecutions.delete(cid);
+            return result;
+        })();
+
+        // Register the promise so other redundant paths can join it.
+        this.activeExecutions.set(cid, executionPromise);
+
+        // Cleanup Cache periodically
+        if (this.resultCache.size > 1000) {
+            const now = Date.now();
+            for (const [id, entry] of this.resultCache) {
+                if (now - entry.time > 10000) this.resultCache.delete(id);
+            }
+        }
+
+        return executionPromise;
+    }
+
+    /**
+     * The P2P Strategy Engine.
+     * Logic Flow: 
+     * 1. Attempt the known primary provider.
+     * 2. If primary is busy/duplicate, accept that as delivery.
+     * 3. If primary fails, cycle through failover providers.
+     * 4. If all known providers fail, flood to random neighbors.
+     * 5. As a last resort, hit the seed (bootstrap) node.
+     */
+    private async forwardToPeer(signal: Signal, cap: string, cid: string): Promise<TraceResult> {
+        const myAddr = this.addr;
+        const myId = this.id;
+        const visitedIds = signal._visitedCellIds || [];
+        const visitedAddr = signal._visitedAddr || [];
+
+        // --- 1. PROVIDER IDENTIFICATION ---
+        // Filter the Atlas for cells providing this capability.
+        // We exclude: ourselves, cells we've already visited, and duplicate addresses.
+        const seenAddrs = new Set<string>();
+
+        const providers = Object.entries(this.atlas)
+            .filter(([key, e]) => {
+                const entryId = e.id || key;
+                const hasCap = e.caps.includes(cap);
+                const isSelf = entryId === myId || e.addr === myAddr;
+                const isVisited = visitedIds.includes(entryId);
+                const isDuplicateAddr = seenAddrs.has(e.addr);
+                const isClientOnly = e.addr.startsWith('client://'); // NEW: Skip client cells for capability routing
+
+                if (hasCap && !isSelf && !isVisited && !isDuplicateAddr && !isClientOnly) {
+                    seenAddrs.add(e.addr);
+                    return true;
+                }
+                return false;
+            })
+            .map(([_, e]) => e);
+
+        // --- 2. PRIMARY & FAILOVER ROUTING ---
+        if (providers.length > 0) {
+            // We iterate through available providers until one accepts or reports busy.
+            for (let i = 0; i < Math.min(providers.length, 4); i++) {
+                const target = providers[i];
+                this.addStep(cid, i === 0 ? "P2P_ROUTE_ATTEMPT" : "P2P_FAILOVER_ATTEMPT", {
+                    target: target.addr,
+                    attempt: i + 1
+                });
+
+                const result = await this.rpc(target.addr, signal);
+
+                // --- THE HANDOFF FIX ---
+                // result.ok is standard success.
+                // DUPLICATE_SIGNAL/ARRIVAL means the signal reached its destination 
+                // via a different path already. This is a mesh SUCCESS.
+                const isDelivered = result.ok ||
+                    result.error?.code === "DUPLICATE_SIGNAL" ||
+                    result.error?.code === "DUPLICATE_ARRIVAL";
+
+                if (isDelivered) {
+                    this.addStep(cid, "P2P_ROUTE_SUCCESS", {
+                        via: target.addr,
+                        status: result.ok ? "OK" : "ALREADY_PROCESSING"
+                    });
+                    return result;
+                }
+
+                // If the error was a loop or something unrecoverable, we stop this branch immediately.
+                if (result.error?.code === "ROUTING_LOOP_PREVENTED") return result;
+            }
+        }
+
+        // --- 3. BOUNDED FLOODING ---
+        // If we found no providers or all providers were unreachable, 
+        // we "Flood" the signal to 3 random neighbors who might have a fresher Atlas.
+        const neighbors = Object.values(this.atlas)
+            .filter(e => e.addr !== myAddr && !visitedIds.includes(e.id || '') && !providers.includes(e))
+            .sort(() => 0.5 - Math.random())
+            .slice(0, 3);
+
+        if (neighbors.length > 0) {
+            this.addStep(cid, "P2P_FLOOD_START", { neighborCount: neighbors.length });
+
+            // We fire these off in parallel (Promise.allSettled) for maximum throughput.
+            const floodResults = await Promise.allSettled(
+                neighbors.map(n => this.rpc(n.addr, signal))
+            );
+
+            for (let i = 0; i < floodResults.length; i++) {
+                const res = floodResults[i];
+                // Check if any flood path resulted in a successful handoff.
+                if (res.status === 'fulfilled') {
+                    const val = res.value;
+                    if (val.ok || val.error?.code === "DUPLICATE_SIGNAL" || val.error?.code === "DUPLICATE_ARRIVAL") {
+                        this.addStep(cid, "P2P_FLOOD_SUCCESS", { via: neighbors[i].addr });
+                        return val;
+                    }
+                }
+            }
+
+            this.addStep(cid, "P2P_FLOOD_FAILED", { attempts: neighbors.length });
+        }
+
+        // --- 4. SEED BOOTSTRAP (LAST RESORT) ---
+        // If the seed is defined and we haven't visited it yet, try it as a last hope.
+        if (this.seed && !visitedAddr.includes(this.seed)) {
+            this.addStep(cid, "P2P_SEED_ATTEMPT", { seed: this.seed });
+            const seedResult = await this.rpc(this.seed, signal);
+
+            if (seedResult.ok || seedResult.error?.code === "DUPLICATE_SIGNAL" || seedResult.error?.code === "DUPLICATE_ARRIVAL") {
+                return seedResult;
+            }
+        }
+
+        // --- 5. EXHAUSTIVE FAILURE ---
+
+        // FAIL-SAFE: If we are about to fail, check the disk one last time.
+        // This fixes the startup race condition where we started before the target existed.
+        if (!signal._registryScanned) { // Prevent infinite loops
+
+            // Force a full read of the registry directory
+            await this.bootstrapFromRegistry(true);
+
+            signal._registryScanned = true;
+
+            // Try routing again with the fresh data
+            return this.forwardToPeer(signal, cap, cid);
+        }
+
+        // Original Failure Logic
+        this.addStep(cid, "P2P_NO_ROUTE", { capability: cap, atlasSize: Object.keys(this.atlas).length });
+
+        return {
+            ok: false,
+            cid,
+            error: {
+                code: "NOT_FOUND",
+                msg: `No route to ${cap} after exhaustive search (Providers: ${providers.length}, Neighbors: ${neighbors.length})`,
+                from: myId,
+                trace: signal.trace || [],
+                history: this.journal[cid]
+            }
+        };
+    }
+
+    private failedAddresses = new Map<string, { count: number, lastFail: number }>();
+
+    public async rpc(addr: string, signal: Signal): Promise<TraceResult> {
+        const failure = this.failedAddresses.get(addr);
+        if (failure && failure.count > 3 && Date.now() - failure.lastFail < 30000) {
+            return {
+                ok: false, cid: signal.id, error: {
+                    code: "CIRCUIT_OPEN",
+                    msg: "Circuit breaker open",
+                    from: addr,
+                    trace: []
+                }
+            };
+        }
+
+        const cid = signal.id;
+        const startTime = performance.now();
+
+        if (signal.payload.capability !== 'mesh/gossip' && signal.payload.capability !== 'cell/contract') {
+            if(signal.payload.capability!=="mesh/gossip"&&signal.payload.capability!=="cell/contract")if(signal.payload.capability!=="mesh/gossip"&&signal.payload.capability!=="cell/contract")if(signal.payload.capability!=="mesh/gossip"&&signal.payload.capability!=="cell/contract")if (signal.payload.capability !== "mesh/gossip" && signal.payload.capability !== "cell/contract") if (signal.payload.capability !== "mesh/gossip" && signal.payload.capability !== "cell/contract") this.log("INFO", `📡 RPC_OUT: [${signal.payload.capability}] -> ${addr}`, cid);
+        }
+        this.addStep(cid, "RPC_ATTEMPT", {
+            target: addr,
+            capability: signal.payload.capability,
+            payloadSize: JSON.stringify(signal.payload).length
+        });
+
+        try {
+            const res = await fetch(addr, {
+                method: "POST",
+                body: JSON.stringify(signal),
+                headers: { "Content-Type": "application/json" },
+                signal: AbortSignal.timeout(600000) // 600 second timeout on requests - 10 minutes
+            });
+
+            const duration = performance.now() - startTime;
+
+            if (!res.ok) {
+                const body = await res.text().catch(() => 'unreadable');
+                this.addStep(cid, "RPC_HTTP_ERROR", {
+                    status: res.status,
+                    statusText: res.statusText,
+                    body: body.substring(0, 200),
+                    duration
+                });
+
+                return {
+                    ok: false,
+                    cid,
+                    error: {
+                        code: "RPC_HTTP_ERR",
+                        msg: `HTTP ${res.status} ${res.statusText} from ${addr}`,
+                        details: {
+                            httpStatus: res.status,
+                            responseBody: body.substring(0, 500),
+                            targetAddress: addr,
+                            duration: Math.round(duration)
+                        },
+                        from: addr,
+                        trace: signal.trace,
+                        history: this.journal[cid]
+                    }
+                };
+            }
+
+            const data = await res.json();
+
+            if (data.atlas) this.mergeAtlas(data.atlas);
+
+            const r = data.result || data;
+
+            // Merge remote narrative if failure occurred
+            if (!r.ok && r.error?.history) {
+                this.journal[cid] = r.error.history;
+            }
+
+            if (r.ok && signal.payload.capability !== "mesh/gossip" && signal.payload.capability !== "cell/contract") { if (signal.payload.capability !== "mesh/gossip" && signal.payload.capability !== "cell/contract") if (signal.payload.capability !== "mesh/gossip" && signal.payload.capability !== "cell/contract") this.log("INFO", "✅ RPC_SUCCESS: [" + signal.payload.capability + "] from " + addr, cid);
+            this.log('WARN', '❌ RPC_REMOTE_FAIL: [' + signal.payload.capability + '] @ ' + addr + ' (' + r.error?.code + ')', cid);
+        }
+        return r;
+
+        } catch (e: any) {
+            const duration = performance.now() - startTime;
+
+            // --- FAIL FAST FIX ---
+            // If the port is closed (cell died), fail immediately. 
+            // Do not let this fall through to generic timeout logic.
+            if (
+                e.code === 'ECONNREFUSED' ||
+                e.message.includes('Connection refused') ||
+                e.message.includes('Network is unreachable') ||
+                e.message.includes('fetch failed')
+            ) {
+                // Determine ID from trace to prune it
+                const targetId = signal.trace.length > 0
+                    ? signal.trace[signal.trace.length - 1].split(':')[0]
+                    : 'unknown';
+
+                // Remove the dead peer immediately so we don't try again
+                this.pruneDeadPeer(targetId);
+
+                return {
+                    ok: false,
+                    cid,
+                    error: {
+                        code: "RPC_UNREACHABLE",
+                        msg: `Target offline (pruned): ${addr}`,
+                        from: addr,
+                        trace: signal.trace,
+                        history: this.journal[cid]
+                    }
+                };
+            }
+
+            // Categorize network errors
+            let errorCode = "RPC_FAIL";
+            let errorDetails: any = {
+                targetAddress: addr,
+                duration: Math.round(duration),
+                errorType: e.constructor.name
+            };
+
+            if (e.name === 'AbortError' || e.message?.includes('timeout')) {
+                errorCode = "RPC_TIMEOUT";
+                errorDetails.reason = "Request timed out after 5000ms";
+                errorDetails.suggestion = "Target cell may be overloaded or unresponsive";
+            } else if (e.message?.includes('ECONNREFUSED') || e.message?.includes('fetch failed')) {
+                errorCode = "RPC_UNREACHABLE";
+                errorDetails.reason = "Connection refused - target is offline";
+                errorDetails.suggestion = "Check if target cell is running and port is correct";
+            } else if (e.message?.includes('JSON')) {
+                errorCode = "RPC_PARSE_ERR";
+                errorDetails.reason = "Invalid JSON response";
+                errorDetails.suggestion = "Target may have returned HTML error page or crashed";
+            }
+
+            this.addStep(cid, errorCode, {
+                error: e.message,
+                duration,
+                ...errorDetails
+            });
+
+            return {
+                ok: false,
+                cid,
+                error: {
+                    code: errorCode,
+                    msg: `${errorCode}: ${e.message}`,
+                    details: errorDetails,
+                    from: addr,
+                    trace: signal.trace,
+                    history: this.journal[cid]
+                }
+            };
+        }
+    }
+
+    /**
+ * Create a pipeline that auto-updates when mesh topology changes.
+ * Returns a proxy that always points to the latest generated implementation.
+ */
+    async livePipeline(config: {
+        target: string;
+        through: string[];
+        name: string;
+        intervalMs?: number;
+    }): Promise<{
+        invoke: (args: any) => Promise<any>;
+        stop: () => void;
+        getHash: () => string;
+    }> {
+        let currentPipeline: any = null;
+        let currentHash = "";
+
+        const stop = await this.watchPipeline({
+            ...config,
+            onUpdate: (module) => {
+                const PipelineClass = Object.values(module).find(
+                    (v: any) => v.prototype?.invoke
+                ) as any;
+
+                if (PipelineClass) {
+                    currentPipeline = new PipelineClass(this);
+                }
+            }
+        });
+
+        return {
+            invoke: async (args: any) => {
+                if (!currentPipeline) {
+                    throw new Error("Pipeline not yet initialized");
+                }
+                return currentPipeline.invoke(args);
+            },
+            stop,
+            getHash: () => currentHash
+        };
+    }
+
+    /**
+     * Generate an optimized pipeline client from live mesh topology.
+     * The generated code is specific to the current cell distribution
+     * and can be hot-reloaded when topology changes.
+     */
+    async pipeline(config: {
+        target: string;
+        through: string[];
+        name?: string;
+    }): Promise<{
+        code: string;
+        filePath: string;
+        moduleUrl: string;
+        topology: any[];
+        hash: string;
+    }> {
+        const result = await this.askMesh("pipeline/generate", config);
+
+        if (!result.ok) {
+            throw new Error(`Pipeline generation failed: ${result.error?.msg || result.error}`);
+        }
+
+        return result.value;
+    }
+
+    /**
+     * Watch for topology changes and auto-regenerate pipeline.
+     * Calls onUpdate with the new pipeline module when cells join/leave.
+     */
+    async watchPipeline(config: {
+        target: string;
+        through: string[];
+        name: string;
+        onUpdate: (module: any) => void | Promise<void>;
+        intervalMs?: number;
+    }): Promise<() => void> {
+        const { target, through, name, onUpdate, intervalMs = 5000 } = config;
+        let lastHash = "";
+        let stopped = false;
+        let timeoutId: Timer | null = null;
+
+        const check = async () => {
+            if (stopped) return;
+
+            try {
+                const result = await this.pipeline({ target, through, name });
+
+                if (result.hash !== lastHash) {
+                    lastHash = result.hash;
+
+                    // Hot-import the generated module
+                    // @ts-ignore
+                    const module = await import(/* @vite-ignore */ result.moduleUrl); // Sketchy... Fuck
+                    await onUpdate(module);
+                }
+            } catch (e) {
+                // Log but don't stop watching - mesh might be temporarily unstable
+                this.log("WARN", `Pipeline watch error: ${e}`);
+            }
+
+            if (!stopped) {
+                timeoutId = setTimeout(check, intervalMs);
+            }
+        };
+
+        // Initial check
+        await check();
+
+        // Return stop function
+        return () => {
+            stopped = true;
+            if (timeoutId) clearTimeout(timeoutId);
+        };
+    }
+
+    private atlasCallbacks: Set<(atlas: Record<string, AtlasEntry>) => void> = new Set();
+
+    public onAtlasUpdate(callback: (atlas: Record<string, AtlasEntry>) => void): () => void {
+        this.atlasCallbacks.add(callback);
+        return () => this.atlasCallbacks.delete(callback);
+    }
+
+    public mergeAtlas(incoming: Record<string, AtlasEntry>, receivedViaGossip = false, hopCount = 0) {
+        if (this.isShuttingDown) return;
+        let now = Date.now();
+
+        for (const [key, entry] of Object.entries(incoming)) {
+            const cellId = entry.id || key;
+            if (cellId === this.id) continue;
+
+            // Fix: Use ID as key, but only if the entry is newer or we don't have it
+            const existing = this.atlas[cellId];
+
+            // STALENESS CHECK: Ignore entries older than 30 seconds
+            if (now - entry.lastSeen > 30000) {
+                if (existing && existing.addr === entry.addr) delete this.atlas[cellId];
+                continue;
+            }
+
+            if (!existing || entry.lastSeen > existing.lastSeen || entry.addr !== existing.addr) {
+                // This is a fresh or better entry
+                this.atlas[cellId] = {
+                    ...entry,
+                    lastGossiped: now,
+                    gossipHopCount: receivedViaGossip ? Math.min((entry.gossipHopCount || 0) + 1, 3) : 0
+                };
+            }
+        }
+
+        // Track changes for logging - ONLY meaningful changes
+        let addedPeers: string[] = [];
+        let removedPeers: string[] = [];
+        let changedPeers: string[] = []; // caps or addr changed, not just timestamp
+
+        for (const [key, entry] of Object.entries(incoming)) {
+            // Determine the actual cell ID
+            let cellId: string;
+
+            // If key looks like a URL, extract ID from entry or skip
+            if (key.startsWith('http://') || key.startsWith('https://')) {
+                cellId = entry.id || '';
+                if (!cellId) {
+                    // No ID provided with address - use address as ID (not ideal but works)
+                    cellId = key;
+                }
+            } else {
+                // Key is already a proper cell ID
+                cellId = key;
+            }
+
+            if (cellId === this.id) continue;
+            if (!cellId) continue;
+            if (hopCount > 3) continue;
+
+            const entryAge = now - entry.lastSeen;
+            if (entryAge > 30000 && !this.atlas[cellId]) continue;
+
+            const existing = this.atlas[cellId];
+
+            if (receivedViaGossip) {
+                const isFreshGossip = entryAge < 10000;
+                if (!existing && !isFreshGossip) continue;
+
+                // Check if MEANINGFUL properties changed (not just timestamp)
+                const meaningfulChange = !existing ||
+                    existing.addr !== entry.addr ||
+                    existing.caps.length !== entry.caps.length ||
+                    existing.caps.some((c, i) => c !== entry.caps[i]) ||
+                    existing.pubKey !== entry.pubKey;
+
+                // Only track as "changed" if meaningful properties differ
+                if (!existing) {
+                    addedPeers.push(cellId);
+                } else if (meaningfulChange) {
+                    changedPeers.push(cellId);
+                }
+
+                // Merge: keep our direct timestamp if newer, use gossip addr if different
+                this.atlas[cellId] = {
+                    addr: entry.addr, // Always use latest address
+                    caps: entry.caps,
+                    pubKey: entry.pubKey,
+                    lastSeen: existing && existing.lastSeen > entry.lastSeen
+                        ? existing.lastSeen  // Keep our newer direct timestamp
+                        : entry.lastSeen,     // Or use theirs if newer
+                    lastGossiped: now,  // Always update this (internal bookkeeping)
+                    gossipHopCount: Math.min((entry.gossipHopCount || 0) + 1, 3)
+                };
+            } else {
+                // Direct contact - always authoritative
+                const meaningfulChange = !existing ||
+                    existing.addr !== entry.addr ||
+                    existing.caps.length !== entry.caps.length ||
+                    existing.caps.some((c, i) => c !== entry.caps[i]);
+
+                if (!existing) {
+                    addedPeers.push(cellId);
+                } else if (meaningfulChange) {
+                    changedPeers.push(cellId);
+                }
+
+                this.atlas[cellId] = {
+                    addr: entry.addr,
+                    caps: entry.caps,
+                    pubKey: entry.pubKey,
+                    lastSeen: now,  // Direct contact = fresh
+                    lastGossiped: now,
+                    gossipHopCount: 0
+                };
+            }
+        }
+
+        // Update self entry (no logging for self)
+        const myAddr = this.addr;
+        if (myAddr) {
+            this.atlas[this.id] = {
+                id: this.id,
+                addr: myAddr,
+                caps: Object.keys(this.handlers),
+                pubKey: this.publicKey,
+                lastSeen: now,
+                lastGossiped: now,
+                gossipHopCount: 0
+            };
+        }
+
+        // Only log if something MEANINGFUL changed
+        const hasChanges = addedPeers.length > 0 || changedPeers.length > 0 || removedPeers.length > 0;
+
+        if (hasChanges) {
+            const parts: string[] = [];
+
+            if (addedPeers.length > 0) {
+                const names = addedPeers.map(id => id.split('_')[0]).join(',');
+                parts.push(`+${addedPeers.length}(${names})`);
+            }
+
+            if (changedPeers.length > 0) {
+                parts.push(`~${changedPeers.length}`);
+            }
+
+            if (removedPeers.length > 0) {
+                parts.push(`-${removedPeers.length}`);
+            }
+
+            const currentPeers = Object.keys(this.atlas).filter(id => id !== this.id).length;
+            const currentCaps = new Set(Object.values(this.atlas).flatMap(e => e.caps)).size;
+
+            const changeStr = parts.join(' ');
+            this.log("INFO", `🌐 ${changeStr} → ${currentPeers}p/${currentCaps}c`);
+        }
+
+        // Notify callbacks only on meaningful changes
+        if (addedPeers.length > 0 || changedPeers.length > 0) {
+            this.atlasCallbacks.forEach(cb => cb(this.atlas));
+        }
+
+        now = Date.now();
+        for (const [id, entry] of Object.entries(this.atlas)) {
+            if (id === this.id) continue;
+            if (now - entry.lastSeen > 60000) { // 60 second timeout
+                delete this.atlas[id];
+                this.log("INFO", `🧹 Cleaned stale entry: ${id}`);
+            }
+        }
+    }
+
+    private async handleRequest(req: Request): Promise<Response> {
+        if (this.isShuttingDown) return new Response("Stopping", { status: 503 });
+
+        // 1. HANDSHAKE
+        if (req.url.endsWith('/announce')) {
+            try {
+                const entry: AtlasEntry = await req.json();
+                this.mergeAtlas({ [entry.addr]: entry }, false, 0);
+                return new Response("OK");
+            } catch (e) {
+                return new Response("Bad Request", { status: 400 });
+            }
+        }
+
+        // 2. REFLECTION
+        if (req.url.endsWith('/atlas')) {
+            return Response.json({ atlas: this.atlas });
+        }
+
+        // 3. PRIMARY MESH ROUTE
+        if (req.method === "POST") {
+            try {
+                const raw: Signal = await req.json();
+
+                if (this.seenNonces.has(raw.id)) {
+                    return Response.json({
+                        result: { ok: true, value: { _meshStatus: "DUPLICATE_ARRIVAL" }, cid: raw.id },
+                        atlas: this.atlas
+                    });
+                }
+
+                if (raw.atlas) this.mergeAtlas(raw.atlas, true, 0);
+
+                const result = await this.route(raw);
+
+                try {
+                    return Response.json({ result, atlas: this.atlas });
+                } catch (err) {
+                    if (result.error) result.error.history = [];
+                    return Response.json({ result, atlas: this.atlas });
+                }
+            } catch (e: any) {
+                return new Response(JSON.stringify({ error: "INVALID_SIGNAL" }), { status: 400 });
+            }
+        }
+
+        return new Response("Rheo Mesh Node: Endpoint not found", { status: 404 });
+    }
+
+    /**
+        * Connect to mesh in client mode (no server, HTTP client only)
+        * For browser environments or cells that only need to call others
+        */
+    public async connect(seedAddr?: string): Promise<void> {
+        this.mode = 'client';
+        this._addr = `client://${this.id}`; // Virtual address for client cells
+
+        if (seedAddr) {
+            this.seed = seedAddr;
+        }
+
+        // Bootstrap from registry to find peers
+        await this.bootstrapFromRegistry(true);
+
+        // If we have a seed, try to connect directly
+        if (this.seed && Object.keys(this.atlas).length === 0) {
+            try {
+                const response = await fetch(`${this.seed}/atlas`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ requester: this.id })
+                });
+                if (response.ok) {
+                    const { atlas } = await response.json();
+                    this.mergeAtlas(atlas, false, 0);
+                }
+            } catch (e) {
+                this.log("WARN", "Could not connect to seed, will retry via gossip");
+            }
+        }
+
+        // Register ourselves (even as client) so others know we exist
+        this.registerToRegistry();
+
+        // Start heartbeat
+        const heartbeat = setInterval(() => this.registerToRegistry(), 5000);
+        this.activeIntervals.push(heartbeat);
+
+        this.log("INFO", `Client cell connected @ ${this._addr}`);
+    }
+
+
+    /**
+ * The Cell Interface Layer.
+ * Responsibility: Serves the HTTP substrate, handles P2P handshake, 
+ * and performs defensive entry-point checks before routing.
+ */
+    public listen() {
+        let actualPort = this.port;
+
+        if (!bunServe) {
+            this.log("WARN", "Native Bun.serve not found. Falling back to Node.js http server...");
+
+            // Use Node.js HTTP server as fallback
+            const nodeServer = createServer((req, res) => {
+                // Convert Node req to Web API Request
+                const chunks: Buffer[] = [];
+                req.on('data', chunk => chunks.push(chunk));
+                req.on('end', async () => {
+                    const body = Buffer.concat(chunks);
+                    const url = `http://localhost:${this.port}${req.url}`;
+
+                    const request = new Request(url, {
+                        method: req.method,
+                        headers: Object.entries(req.headers).reduce((acc, [k, v]) => {
+                            if (v) acc[k] = Array.isArray(v) ? v.join(', ') : v;
+                            return acc;
+                        }, {} as Record<string, string>),
+                        body: body.length > 0 ? body : undefined
+                    });
+
+                    try {
+                        const response = await this.handleRequest(request);
+                        res.statusCode = response.status;
+                        response.headers.forEach((value, key) => {
+                            res.setHeader(key, value);
+                        });
+                        const responseBody = await response.text();
+                        res.end(responseBody);
+                    } catch (e) {
+                        res.statusCode = 500;
+                        res.end(JSON.stringify({ error: "Internal Server Error" }));
+                    }
+                });
+            });
+
+            nodeServer.listen(this.port, () => {
+                const address = nodeServer.address();
+                if (address && typeof address === 'object') {
+                    this.port = address.port;
+                    this._addr = `http://localhost:${address.port}`;
+
+                    // Store server for shutdown
+                    (this as any).server = {
+                        stop: () => nodeServer.close(),
+                        port: address.port
+                    };
+
+                    this.completeListenSetup();
+                }
+            });
+
+            return;
+        }
+
+        try {
+            this.server = bunServe({
+                port: this.port,
+                fetch: this.handleRequest.bind(this)
+            });
+
+            actualPort = this.server.port;
+        } catch (e: any) {
+            if (e.code === 'EADDRINUSE') {
+                this.log("WARN", `Port ${this.port} in use, seeking alternative...`);
+                this.server = bunServe({
+                    port: 0,
+                    fetch: this.handleRequest.bind(this)
+                });
+                actualPort = this.server.port;
+            } else { throw e; }
+        }
+
+        // --- POST-BOOT INITIALIZATION ---
+        this.port = actualPort;
+        this._addr = `http://localhost:${actualPort}`;
+
+        this.completeListenSetup();
+    }
+
+    /**
+     * Complete the listen setup (shared between Bun and Node paths)
+     */
+    private completeListenSetup() {
+        // Ensure we are the first entry in our own Atlas.
+        this.atlas[this.id] = {
+            id: this.id, addr: this._addr, caps: Object.keys(this.handlers),
+            pubKey: this.publicKey, lastSeen: Date.now(),
+            lastGossiped: Date.now(), gossipHopCount: 0
+        };
+
+        // --- DECENTRALIZED REGISTRY BOOTSTRAP ---
+        this.registerToRegistry();
+        this.bootstrapFromRegistry().catch(() => { });
+
+        // Heartbeat: Update registry file every 5s to stay "alive"
+        const heartbeat = setInterval(() => this.registerToRegistry(), 5000);
+        this.activeIntervals.push(heartbeat);
+
+        this.log("INFO", `Sovereign Cell online @ ${this._addr}`);
+        this.saveManifest();
+
+        // Burst announce to speed up test convergence
+        const announce = () => {
+            const myEntry: AtlasEntry = {
+                id: this.id,
+                addr: this._addr,
+                caps: Object.keys(this.handlers),
+                pubKey: this.publicKey,
+                lastSeen: Date.now(),
+                lastGossiped: Date.now(),
+                gossipHopCount: 0
+            };
+
+
+            const targets = Object.values(this.atlas)
+                .filter(e =>
+                    e.addr !== this._addr &&
+                    !e.addr.startsWith('client://') // NEW: Don't announce to clients
+                )
+                .sort(() => 0.5 - Math.random())
+                .slice(0, 3);
+
+            targets.forEach(target => {
+                fetch(`${target.addr}/announce`, {
+                    method: "POST",
+                    body: JSON.stringify(myEntry),
+                    headers: { "Content-Type": "application/json" }
+                }).catch(() => { });
+            });
+        };
+
+        const gossip = () => {
+            const peers = Object.values(this.atlas)
+                .filter(e => e.addr !== this._addr)
+                .sort(() => 0.5 - Math.random())
+                .slice(0, 2);
+
+            peers.forEach(peer => {
+                this.rpc(peer.addr, {
+                    id: randomUUID(),
+                    from: this.id,
+                    intent: "ASK",
+                    payload: { capability: "mesh/gossip", args: { atlas: this.atlas } },
+                    proofs: {},
+                    atlas: this.atlas,
+                    trace: [],
+                    _steps: [],
+                    _hops: 0
+                } as Signal).catch(() => { });
+            });
+        };
+
+        const healPartition = () => {
+            const peerCount = Object.keys(this.atlas).length - 1;
+            if (peerCount < 2 && this.seed) {
+                fetch(`${this.seed}/announce`, {
+                    method: "POST",
+                    body: JSON.stringify({
+                        id: this.id,
+                        addr: this._addr,
+                        caps: Object.keys(this.handlers),
+                        pubKey: this.publicKey,
+                        lastSeen: Date.now(),
+                        lastGossiped: Date.now(),
+                        gossipHopCount: 0
+                    }),
+                    headers: { "Content-Type": "application/json" }
+                }).catch(() => { });
+            }
+        };
+
+        // Burst announce for rapid convergence
+        announce();
+        setTimeout(announce, 200);
+        setTimeout(announce, 500);
+        setTimeout(announce, 1000);
+
+        const announceInterval = setInterval(announce, 10000);
+        this.activeIntervals.push(announceInterval);
+
+        setTimeout(gossip, 500);
+        const gossipInterval = setInterval(gossip, 15000);
+        this.activeIntervals.push(gossipInterval);
+
+        const healInterval = setInterval(healPartition, 30000);
+        this.activeIntervals.push(healInterval);
+    }
+
+    // private async fetchSeedAtlas() {
+    //     // Ask seed for its entire atlas immediately
+    //     try {
+    //         const res = await fetch(`${this.seed}/atlas`, {
+    //             method: "POST",
+    //             body: JSON.stringify({ requester: this.id }),
+    //             headers: { "Content-Type": "application/json" }
+    //         });
+    //         if (res.ok) {
+    //             const { atlas } = await res.json();
+    //             this.mergeAtlas(atlas, false, 0); // Direct contact = authoritative
+    //         }
+    //     } catch (e) {
+    //         // Seed not ready yet, will get via normal gossip
+    //     }
+    // }
+
+    private detectLoopCause(signal: Signal): string {
+        const trace = signal.trace || [];
+        const ids = trace.map(t => t.split(':')[0]);
+        const duplicates = ids.filter((item, index) => ids.indexOf(item) !== index);
+
+        if (duplicates.length > 0) {
+            return `Cell(s) ${[...new Set(duplicates)].join(', ')} appear multiple times in path - routing logic may be forwarding back to sender`;
+        }
+
+        if (signal.from === this.id) {
+            return "Signal 'from' field matches current cell ID - possible self-forwarding";
+        }
+
+        return "Unknown - check for duplicate signal generation or stale Atlas entries";
+    }
+}
+
+// --- 🛡️ NATIVE TYPE SYSTEM (Sovereign Schema) ---
+
+export interface JsonSchema {
+    type: string;
+    properties?: Record<string, JsonSchema>;
+    items?: JsonSchema;
+    required?: string[];
+    enum?: any[];
+}
+
+// En wrapper för att bära både Runtime Schema och Compile-time Type
+export class TypeDef<T> {
+    constructor(public schema: JsonSchema) { }
+
+    optional(): TypeDef<T | undefined> {
+        return new TypeDef({ ...this.schema, _optional: true } as any);
+    }
+}
+
+// Typ-hjälpare för att extrahera T från TypeDef<T>
+export type Infer<T> = T extends TypeDef<infer U> ? U : never;
+
+export const S = {
+    string: () => new TypeDef<string>({ type: "string" }),
+    number: () => new TypeDef<number>({ type: "number" }),
+    boolean: () => new TypeDef<boolean>({ type: "boolean" }),
+    any: () => new TypeDef<any>({ type: "object" }), // Fallback
+
+    // Enums
+    enum: <U extends string>(values: [U, ...U[]]) =>
+        new TypeDef<U>({ type: "string", enum: values }),
+
+    // Arrays
+    array: <T>(item: TypeDef<T>) =>
+        new TypeDef<T[]>({ type: "array", items: item.schema }),
+
+    // Objects
+    object: <T extends Record<string, TypeDef<any>>>(shape: T) => {
+        const properties: Record<string, JsonSchema> = {};
+        const required: string[] = [];
+
+        for (const [key, def] of Object.entries(shape)) {
+            properties[key] = def.schema;
+            // Hack: Vi markerar optional internt, standard JSON schema har required-listan
+            if (!(def.schema as any)._optional) {
+                required.push(key);
+            }
+        }
+
+        return new TypeDef<{ [K in keyof T]: Infer<typeof shape[K]> }>({
+            type: "object",
+            properties,
+            required
+        });
+    }
+};
+
+/**
+ * Helper för att skapa kontrakt utan externa deps
+ */
+export function createContract<I extends TypeDef<any>, O extends TypeDef<any>>(
+    capability: string,
+    def: { input: I; output: O }
+): Contract {
+    return {
+        capability,
+        version: "1.0.0",
+        inputSchema: def.input.schema,
+        outputSchema: def.output.schema,
+        compatibility: [],
+        transport: { protocol: "INTERNAL", adapters: [] }
+    };
+}

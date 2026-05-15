@@ -1,0 +1,573 @@
+// A example implementation of cell architecture and ideas
+// Pattern: Narrative Transparent Substrate (NTS-1)
+use axum::{extract::State, routing::post, Json, Router};
+use chrono::Utc;
+use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+use futures::future::BoxFuture;
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+use uuid::Uuid;
+
+// --- TYPES & INTERFACES ---
+
+/**
+ * NarrativeStep: Chronological causality marker.
+ */
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NarrativeStep {
+    pub cell: String,
+    pub timestamp: i64,
+    pub action: String,
+    pub data: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AtlasEntry {
+    pub addr: String,
+    pub caps: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pub_key: Option<String>, // Indentity vouching
+    pub last_seen: i64,
+    #[serde(default)] 
+    pub last_gossiped: i64,
+    #[serde(default)]
+    pub gossip_hop_count: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceError {
+    pub code: String,
+    pub msg: String,
+    pub from: String,
+    pub trace: Vec<String>,
+    pub history: Option<Vec<NarrativeStep>>, // The Evidence Chain
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceResult {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TraceError>,
+    pub cid: String,
+}
+
+/**
+ * Signal: The Transparent Rust Envelope.
+ */
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Signal {
+    pub id: String,
+    pub from: String,
+    pub intent: String,
+    pub payload: SignalPayload,
+    pub proofs: Option<HashMap<String, String>>,
+    pub atlas: Option<HashMap<String, AtlasEntry>>,
+    pub trace: Option<Vec<String>>,
+    #[serde(rename = "_steps")]
+    pub steps: Option<Vec<NarrativeStep>>, // Narrative Black Box
+    #[serde(flatten)]
+    pub unknown_fields: HashMap<String, Value>, // Transparency/Wire Compatibility
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalPayload {
+    pub capability: String,
+    pub args: Value,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponsePacket {
+    pub result: Value,
+    pub atlas: HashMap<String, AtlasEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Contract {
+    pub capability: String,
+    pub version: String,
+    pub input_schema: Value,
+    pub output_schema: Value,
+    pub transport: Value,
+    pub machine: Option<Value>,
+    pub compatibility: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CellManifest {
+    pub pid: u32,
+    pub version: String,
+    pub port: u16,
+    pub start_time: i64,
+    pub capabilities: Vec<String>,
+    pub seed: String,
+    pub pub_key: String,
+}
+
+type AsyncHandler = Box<
+    dyn Fn(Value, Signal) -> BoxFuture<'static, TraceResult>
+        + Send
+        + Sync,
+>;
+
+// --- CORE RHEO CELL ---
+
+pub struct RheoCell {
+    pub id: String,
+    pub seed: String,
+    pub addr: RwLock<String>,
+    pub port: RwLock<u16>,
+    pub atlas: RwLock<HashMap<String, AtlasEntry>>,
+    pub contracts: RwLock<HashMap<String, Contract>>,
+    pub seen_nonces: RwLock<HashSet<String>>,
+    pub handlers: RwLock<HashMap<String, Arc<AsyncHandler>>>,
+    pub manifest_path: String,
+    pub is_shutting_down: Arc<RwLock<bool>>,
+    // Cryptographic Identity (Ed25519)
+    pub signing_key: SigningKey,
+    pub pub_key_hex: String,
+}
+
+impl RheoCell {
+    pub fn new(id: String, seed: String) -> Arc<Self> {
+        let manifest_path = "cell.json".to_string();
+        let mut sticky_port = 0;
+
+        if let Ok(content) = fs::read_to_string(&manifest_path) {
+            if let Ok(m) = serde_json::from_str::<CellManifest>(&content) {
+                sticky_port = m.port;
+            }
+        }
+
+        // Generate Identity
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pub_key_hex = hex::encode(VerifyingKey::from(&signing_key).to_bytes());
+
+        let cell = Arc::new(Self {
+            id, seed,
+            addr: RwLock::new(String::new()),
+            port: RwLock::new(sticky_port),
+            atlas: RwLock::new(HashMap::new()),
+            contracts: RwLock::new(HashMap::new()),
+            seen_nonces: RwLock::new(HashSet::new()),
+            handlers: RwLock::new(HashMap::new()),
+            manifest_path,
+            is_shutting_down: Arc::new(RwLock::new(false)),
+            signing_key, pub_key_hex,
+        });
+
+        cell.cleanup_ghost_processes();
+
+        // Standard DEFAULTS
+        cell.provide("mesh/ping", |_a, s| {
+            Box::pin(async move {
+                TraceResult { ok: true, value: Some(json!("PONG")), error: None, cid: s.id }
+            })
+        });
+
+        cell.provide("cell/contract", {
+            let c = cell.clone();
+            move |args, s| {
+                let cell = c.clone();
+                Box::pin(async move {
+                    let cap = args["cap"].as_str().unwrap_or("");
+                    let contracts = cell.contracts.read().unwrap();
+                    TraceResult { 
+                        ok: true, 
+                        value: Some(json!(contracts.get(cap))), 
+                        error: None, cid: s.id 
+                    }
+                })
+            }
+        });
+
+        cell
+    }
+
+    pub fn vouch(&self, cap_part: &str, signal_id: &str) -> String {
+        let msg = format!("{}:{}", signal_id, cap_part);
+        hex::encode(self.signing_key.sign(msg.as_bytes()).to_bytes())
+    }
+
+    pub fn verify_vouch(&self, cap_part: &str, signal_id: &str, sig_hex: &str, pub_key_hex: &str) -> bool {
+        let msg = format!("{}:{}", signal_id, cap_part);
+        let Ok(sig_bytes) = hex::decode(sig_hex) else { return false; };
+        let Ok(signature) = Signature::from_slice(&sig_bytes) else { return false; };
+        let Ok(pk_bytes) = hex::decode(pub_key_hex) else { return false; };
+        let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes) else { return false; };
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_arr) else { return false; };
+        verifying_key.verify(msg.as_bytes(), &signature).is_ok()
+    }
+
+    fn cleanup_ghost_processes(&self) {
+        if let Ok(content) = fs::read_to_string(&self.manifest_path) {
+            if let Ok(m) = serde_json::from_str::<CellManifest>(&content) {
+                if m.pid != std::process::id() as u32 {
+                    let _ = unsafe { libc::kill(m.pid as libc::pid_t, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+
+    pub fn provide<F, Fut>(&self, cap: &str, handler: F)
+    where
+        F: Fn(Value, Signal) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = TraceResult> + Send + 'static,
+    {
+        let wrapped = move |args, signal| {
+            let boxed: BoxFuture<'static, TraceResult> = Box::pin(handler(args, signal));
+            boxed
+        };
+        self.handlers.write().unwrap().insert(cap.to_string(), Arc::new(Box::new(wrapped)));
+    }
+
+    pub fn provide_contract<F, Fut>(&self, contract: Contract, handler: F)
+    where
+        F: Fn(Value, Signal) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = TraceResult> + Send + 'static,
+    {
+        let cap = contract.capability.clone();
+        self.contracts.write().unwrap().insert(cap.clone(), contract);
+        self.provide(&cap, handler);
+    }
+
+    pub async fn route(&self, mut signal: Signal) -> TraceResult {
+        let cap = signal.payload.capability.clone();
+        
+        // Narrative Entry recording
+        let mut steps = signal.steps.clone().unwrap_or_default();
+        steps.push(NarrativeStep {
+            cell: self.id.clone(),
+            timestamp: Utc::now().timestamp_millis(),
+            action: "RECEIVED_SIGNAL".into(),
+            data: Some(json!({ "capability": cap })),
+        });
+        signal.steps = Some(steps.clone());
+
+        // Mesh Metadata Update
+        let mut trace = signal.trace.clone().unwrap_or_default();
+        trace.push(format!("{}:{}:{}", self.id, std::process::id(), Utc::now().timestamp_millis()));
+        signal.trace = Some(trace);
+        signal.atlas = Some(self.atlas.read().unwrap().clone());
+
+        let local_handler = self.handlers.read().unwrap().get(&cap).cloned();
+        if let Some(handler) = local_handler {
+            let mut result = handler(signal.payload.args.clone(), signal.clone()).await;
+            if !result.ok {
+                if let Some(mut err) = result.error.take() {
+                    err.history = Some(steps); // Transfer story to error
+                    result.error = Some(err);
+                }
+            }
+            result
+        } else {
+            // Forwarding Router
+            self.forward_transparent(signal).await
+        }
+    }
+
+    pub async fn forward_transparent(&self, mut signal: Signal) -> TraceResult {
+        let cap = &signal.payload.capability;
+        let my_addr = self.addr.read().unwrap().clone();
+        
+        // Track visited to prevent loops (Rust implementation of _visited)
+        let mut visited: Vec<String> = signal.unknown_fields.get("_visited")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+
+        if visited.contains(&my_addr) {
+            return TraceResult { ok: false, value: None, cid: signal.id, error: Some(TraceError { code: "LOOP".into(), msg: "Loop detected".into(), from: self.id.clone(), ..Default::default() })};
+        }
+        visited.push(my_addr.clone());
+        signal.unknown_fields.insert("_visited".into(), json!(visited));
+
+        // 1. Direct Routing
+        let direct_addr = {
+            let atlas = self.atlas.read().unwrap();
+            atlas.values()
+                .find(|e| e.caps.contains(cap) && e.addr != my_addr && !visited.contains(&e.addr))
+                .map(|e| e.addr.clone())
+        };
+
+        if let Some(addr) = direct_addr {
+            return self.rpc_raw(&addr, signal).await;
+        }
+
+        // 2. Bounded Flood (Ask 2 random neighbors)
+        let neighbors: Vec<String> = {
+            use rand::seq::SliceRandom;
+            let atlas = self.atlas.read().unwrap();
+            let mut n: Vec<String> = atlas.values()
+                .filter(|e| e.addr != my_addr && !visited.contains(&e.addr))
+                .map(|e| e.addr.clone())
+                .collect();
+            let mut rng = rand::thread_rng();
+            n.shuffle(&mut rng);
+            n.into_iter().take(2).collect()
+        };
+
+        for addr in neighbors {
+            let res = self.rpc_raw(&addr, signal.clone()).await;
+            if res.ok { return res; }
+        }
+
+        // 3. Last Resort: Bootstrap Seed
+        if !self.seed.is_empty() && !visited.contains(&self.seed) {
+            return self.rpc_raw(&self.seed, signal).await;
+        }
+
+        TraceResult {
+            ok: false, value: None, cid: signal.id,
+            error: Some(TraceError { code: "NOT_FOUND".into(), msg: format!("Mesh search failed for {}", cap), from: self.id.clone(), ..Default::default() }),
+        }
+    }
+
+    async fn rpc_raw(&self, addr: &str, signal: Signal) -> TraceResult {
+        let cid = signal.id.clone();
+        let start_time = std::time::Instant::now();
+        
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build() 
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[RheoCell] [{}] Failed to build HTTP client: {}", self.id, e);
+                return TraceResult {
+                    ok: false,
+                    value: None,
+                    cid,
+                    error: Some(TraceError {
+                        code: "CLIENT_BUILD_FAIL".into(),
+                        msg: format!("Failed to build HTTP client: {}", e),
+                        from: self.id.clone(),
+                        trace: signal.trace.clone().unwrap_or_default(),
+                        history: signal.steps.clone(),
+                    }),
+                };
+            }
+        };
+
+        let mut steps = signal.steps.clone().unwrap_or_default();
+        steps.push(NarrativeStep {
+            cell: self.id.clone(),
+            timestamp: Utc::now().timestamp_millis(),
+            action: "RPC_ATTEMPT".into(),
+            data: Some(json!({
+                "target": addr,
+                "capability": signal.payload.capability,
+                "signal_id": cid
+            })),
+        });
+
+        match client.post(addr).json(&signal).send().await {
+            Ok(res) => {
+                let duration = start_time.elapsed().as_millis();
+                let status = res.status();
+                let text = match res.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[RheoCell] [{}] Failed to read response body from {}: {}", self.id, addr, e);
+                        return TraceResult {
+                            ok: false,
+                            value: None,
+                            cid,
+                            error: Some(TraceError {
+                                code: "BODY_READ_FAIL".into(),
+                                msg: format!("Failed to read response body: {}", e),
+                                from: addr.to_string(),
+                                trace: signal.trace.clone().unwrap_or_default(),
+                                history: Some(steps),
+                            }),
+                        };
+                    }
+                };
+
+                // Parse ResponsePacket
+                let packet: ResponsePacket = match serde_json::from_str(&text) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[RheoCell] [{}] Failed to parse ResponsePacket from {}: {}", 
+                            self.id, addr, e);
+                        return TraceResult {
+                            ok: false,
+                            value: None,
+                            cid,
+                            error: Some(TraceError {
+                                code: "PACKET_PARSE_FAIL".into(),
+                                msg: format!("Failed to parse ResponsePacket: {}", e),
+                                from: addr.to_string(),
+                                trace: signal.trace.clone().unwrap_or_default(),
+                                history: Some(steps),
+                            }),
+                        };
+                    }
+                };
+
+                // Merge atlas
+                self.merge_atlas(packet.atlas);
+
+                // CLONE result before parsing to avoid move issues
+                let result_value = packet.result.clone();
+                
+                // Parse TraceResult with detailed error
+                match serde_json::from_value::<TraceResult>(result_value) {
+                    Ok(result) => {
+                        if result.ok {
+                            eprintln!("[RheoCell] [{}] RPC SUCCESS to {} ({}ms): {}", 
+                                self.id, addr, duration, cid);
+                        } else {
+                            eprintln!("[RheoCell] [{}] RPC REMOTE_ERROR from {} ({}ms): {} - {}", 
+                                self.id, addr, duration, 
+                                result.error.as_ref().map(|e| e.code.clone()).unwrap_or_default(),
+                                result.error.as_ref().map(|e| e.msg.clone()).unwrap_or_default());
+                        }
+                        result
+                    }
+                    Err(e) => {
+                        eprintln!("[RheoCell] [{}] Failed to parse TraceResult from {}: {}", 
+                            self.id, addr, e);
+                        // Now we can safely use packet.result for debug since we cloned it
+                        eprintln!("[RheoCell] [{}] Raw result was: {}", 
+                            self.id, serde_json::to_string_pretty(&packet.result).unwrap_or_default());
+                        
+                        TraceResult {
+                            ok: false,
+                            value: None,
+                            cid,
+                            error: Some(TraceError {
+                                code: "RESULT_PARSE_FAIL".into(),
+                                msg: format!("Failed to parse TraceResult: {}", e),
+                                from: addr.to_string(),
+                                trace: signal.trace.clone().unwrap_or_default(),
+                                history: Some(steps),
+                            }),
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let duration = start_time.elapsed().as_millis();
+                let error_msg = format!("HTTP request failed after {}ms: {}", duration, e);
+                eprintln!("[RheoCell] [{}] RPC FAIL to {}: {}", self.id, addr, error_msg);
+                
+                TraceResult {
+                    ok: false,
+                    value: None,
+                    cid,
+                    error: Some(TraceError {
+                        code: "RPC_FAIL".into(),
+                        msg: error_msg,
+                        from: addr.to_string(),
+                        trace: signal.trace.clone().unwrap_or_default(),
+                        history: Some(steps),
+                    }),
+                }
+            }
+        }
+    }
+
+    pub fn merge_atlas(&self, incoming: HashMap<String, AtlasEntry>) {
+        let mut atlas = self.atlas.write().unwrap();
+        let now = Utc::now().timestamp_millis();
+        
+        for (id, entry) in incoming {
+            if id == self.id { continue; }
+            
+            // Skip stale entries (30 second timeout)
+            if now - entry.last_seen > 30000 && !atlas.contains_key(&id) {
+                continue;
+            }
+            
+            let mut updated_entry = entry;
+            // Update timestamp to now (we just heard about this cell)
+            updated_entry.last_seen = now;
+            updated_entry.last_gossiped = now;
+            updated_entry.gossip_hop_count = std::cmp::min(updated_entry.gossip_hop_count + 1, 3);
+            
+            atlas.insert(id, updated_entry);
+        }
+        
+        // Update self entry
+        if let Ok(addr) = self.addr.read() {
+            if !addr.is_empty() {
+               let self_entry = AtlasEntry {
+                    id: Some(self.id.clone()), // Ensure this is Some
+                    addr: addr_str.clone(),
+                    caps: self.handlers.iter().map(|e| e.key().clone()).collect(),
+                    pub_key: self.pub_key_hex.clone(),
+                    last_seen: now_millis(),
+                    last_gossiped: now_millis(),
+                    gossip_hop_count: 0,
+                    metadata: None,
+                    latency_ms: None,
+                };
+                atlas.insert(self.id.clone(), self_entry);
+            }
+        }
+    }
+
+    pub async fn listen(self: Arc<Self>) {
+        let sticky_port = *self.port.read().unwrap();
+        
+        let listener_result = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", sticky_port)).await;
+        let listener = match listener_result {
+            Ok(l) => l,
+            Err(_) => tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap(),
+        };
+
+        let port = listener.local_addr().unwrap().port();
+        let my_addr = format!("http://localhost:{}", port);
+        {
+            *self.addr.write().unwrap() = my_addr.clone();
+            *self.port.write().unwrap() = port;
+        }
+
+        println!("🟢 [Rust] {} Online @ {}", self.id, port);
+        
+        // PRESENCE HEARTBEAT / REGISTRATION LOOP
+        let c1 = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let addr = c1.addr.read().unwrap().clone();
+                if !addr.is_empty() {
+                    let sig = Signal {
+                        id: Uuid::new_v4().to_string(), from: c1.id.clone(), intent: "ASK".into(),
+                        payload: SignalPayload { capability: "port/register".into(), args: json!({
+                            "id": c1.id, "addr": addr, "caps": c1.handlers.read().unwrap().keys().cloned().collect::<Vec<String>>()
+                        }) },
+                        proofs: Some(HashMap::new()), atlas: Some(c1.atlas.read().unwrap().clone()),
+                        trace: Some(vec![]), steps: Some(vec![]), unknown_fields: HashMap::new(),
+                    };
+                    let _ = reqwest::Client::new().post(&c1.seed).json(&sig).send().await;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        axum::serve(listener, Router::new().route("/", post(handle_signal)).with_state(self)).await.unwrap();
+    }
+}
+
+async fn handle_signal(State(cell): State<Arc<RheoCell>>, Json(signal): Json<Signal>) -> Json<ResponsePacket> {
+    if let Some(atlas) = signal.atlas.clone() { cell.merge_atlas(atlas); }
+    let result = serde_json::to_value(cell.route(signal).await).unwrap();
+    Json(ResponsePacket { result, atlas: cell.atlas.read().unwrap().clone() })
+}

@@ -1,0 +1,37 @@
+--- TS ERRORS ---
+Resolving dependencies
+Resolved, downloaded and extracted [2]
+Saved lockfile
+browser-shim.ts(38,12): error TS2448: Block-scoped variable 'crypto' used before its declaration.
+core.ts(327,15): error TS2440: Import declaration conflicts with local declaration of 'Signal'.
+core.ts(327,23): error TS2440: Import declaration conflicts with local declaration of 'TraceResult'.
+core.ts(327,36): error TS2440: Import declaration conflicts with local declaration of 'TraceError'.
+core.ts(327,48): error TS2440: Import declaration conflicts with local declaration of 'NarrativeStep'.
+core.ts(551,52): error TS2345: Argument of type 'ExecutionStep | undefined' is not assignable to parameter of type 'ExecutionStep | null'.
+  Type 'undefined' is not assignable to type 'ExecutionStep | null'.
+core.ts(913,13): error TS18048: 'remoteEnvelope.current._hops' is possibly 'undefined'.
+core.ts(913,44): error TS18048: 'local.current._hops' is possibly 'undefined'.
+core.ts(1037,25): error TS2552: Cannot find name 'KeyObject'. Did you mean 'Object'?
+core.ts(1318,30): error TS18046: 'e' is of type 'unknown'.
+core.ts(1733,63): error TS2345: Argument of type '{ capability: string; }' is not assignable to parameter of type 'string'.
+core.ts(1755,76): error TS2345: Argument of type '{ capability: string; }' is not assignable to parameter of type 'string'.
+core.ts(1762,76): error TS2345: Argument of type '{ error: any; }' is not assignable to parameter of type 'string'.
+core.ts(1825,49): error TS2322: Type 'TraceResult | null' is not assignable to type 'TraceResult'.
+  Type 'null' is not assignable to type 'TraceResult'.
+core.ts(1831,48): error TS2322: Type 'TraceResult | null' is not assignable to type 'TraceResult'.
+  Type 'null' is not assignable to type 'TraceResult'.
+core.ts(1878,55): error TS2345: Argument of type '{ target: string; attempt: number; }' is not assignable to parameter of type 'string'.
+core.ts(1882,72): error TS2345: Argument of type '{ via: string; }' is not assignable to parameter of type 'string'.
+core.ts(1914,62): error TS2345: Argument of type '{ neighborCount: number; }' is not assignable to parameter of type 'string'.
+core.ts(1922,72): error TS2345: Argument of type '{ via: string; }' is not assignable to parameter of type 'string'.
+core.ts(1936,63): error TS2345: Argument of type '{ seed: string | undefined; }' is not assignable to parameter of type 'string'.
+core.ts(1952,67): error TS2345: Argument of type '{ capability: string; peersInAtlas: number; }' is not assignable to parameter of type 'string'.
+core.ts(2004,58): error TS2345: Argument of type '{ target: string; capability: string; payloadSize: number; }' is not assignable to parameter of type 'string'.
+core.ts(2022,69): error TS2345: Argument of type '{ status: number; statusText: string; body: string; duration: number; }' is not assignable to parameter of type 'string'.
+typed-mesh.ts(134,23): error TS2304: Cannot find name 'MeshError'.
+typed-mesh.ts(263,29): error TS2556: A spread argument must either have a tuple type or be passed to a rest parameter.
+typed-mesh.ts(320,41): error TS2554: Expected 2-3 arguments, but got 1.
+
+--- TRADING ERRORS ---
+
+--- TEST-1-RS ERRORS ---
