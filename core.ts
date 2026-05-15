@@ -1133,7 +1133,12 @@ export class RheoCell {
     }
 
     constructor(public id: string, public port: number = 0, public seed?: string) {
-        if (process.env.RHEO_CELL_ID) this.id = process.env.RHEO_CELL_ID;
+        if (process.env.RHEO_CELL_ID) {
+            this.id = process.env.RHEO_CELL_ID;
+        } else {
+            // FIX: Strip _PID if run manually so cells reuse the same ID and registry file
+            this.id = this.id.replace(/_\d+$/, '');
+        }
 
         this.cellDir = process.cwd();
 
@@ -1142,15 +1147,40 @@ export class RheoCell {
         if (!existsSync(manifestDir)) mkdirSync(manifestDir, { recursive: true });
         this.manifestPath = join(manifestDir, `${this.id}.cell.json`);
 
-        // --- IDENTITY GENERATION (Session-based Ed25519) ---
-        // Generate Identity with explicit Ed25519
-        // Remove the encoding options to get KeyObjects
-        const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-        this.privateKey = privateKey;  // This is a KeyObject
-        this.publicKey = publicKey.export({ type: 'spki', format: 'pem' });  // Export as PEM string
+        // --- IMMORTAL IDENTITY GENERATION (Ed25519) ---
+        const IDENTITIES_DIR = process.env.RHEO_IDENTITIES_DIR || join(homedir(), ".rheo", "identities");
+        if (!existsSync(IDENTITIES_DIR)) mkdirSync(IDENTITIES_DIR, { recursive: true });
+
+        const identityFile = join(IDENTITIES_DIR, `${this.id}.json`);
+
+        if (existsSync(identityFile)) {
+            // Reuse existing identity
+            const keys = JSON.parse(readFileSync(identityFile, 'utf8'));
+            const { createPrivateKey } = require('node:crypto');
+            this.privateKey = createPrivateKey(keys.privateKey);
+            this.publicKey = keys.publicKey;
+        } else {
+            // Generate and save new immortal identity
+            const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+            this.privateKey = privateKey;
+            this.publicKey = publicKey.export({ type: 'spki', format: 'pem' }) as string;
+
+            const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+            writeFileSync(identityFile, JSON.stringify({
+                publicKey: this.publicKey,
+                privateKey: privPem
+            }, null, 2));
+        }
 
         // Log key fingerprint for debugging
-        const pubKeyBuffer = publicKey.export({ type: 'spki', format: 'der' });
+        let pubKeyObject: KeyObject;
+        if (this.publicKey) {
+            pubKeyObject = createPublicKey(this.publicKey);
+        } else {
+            // Should not happen, but fallback (generate temporary)
+            pubKeyObject = generateKeyPairSync('ed25519').publicKey;
+        }
+        const pubKeyBuffer = pubKeyObject.export({ type: 'spki', format: 'der' });
         const fingerprint = createHash('sha256').update(pubKeyBuffer).digest('hex').substring(0, 16);
         console.log(`[${this.id}] Key fingerprint: ${fingerprint}`);
 
@@ -1287,19 +1317,32 @@ export class RheoCell {
             addr: this.addr,
             caps: Object.keys(this.handlers),
             pubKey: this.publicKey,
+            firstSeen: this.atlas[this.id]?.firstSeen || Date.now(),
             lastSeen: Date.now(),
             lastGossiped: Date.now(),
-            gossipHopCount: 0
+            gossipHopCount: 0,
+            status: 'online'
         };
         try {
             writeFileSync(join(REGISTRY_DIR, `${this.id}.json`), JSON.stringify(entry));
         } catch (e) { }
     }
 
-    private removeFromRegistry() {
+    private markOfflineInRegistry() {
         try {
-            const file = join(REGISTRY_DIR, `${this.id}.json`);
-            if (existsSync(file)) unlinkSync(file);
+            if (!this.addr) return;
+            const entry: AtlasEntry = {
+                id: this.id,
+                addr: this.addr,
+                caps: Object.keys(this.handlers),
+                pubKey: this.publicKey,
+                firstSeen: this.atlas[this.id]?.firstSeen || Date.now(),
+                lastSeen: Date.now(),
+                lastGossiped: Date.now(),
+                gossipHopCount: 0,
+                status: 'offline'
+            };
+            writeFileSync(join(REGISTRY_DIR, `${this.id}.json`), JSON.stringify(entry));
         } catch (e) { }
     }
 
@@ -1467,7 +1510,7 @@ export class RheoCell {
     public handleShutdown(): TraceResult {
         if (this.isShuttingDown) return { ok: true, cid: randomUUID() };
         this.isShuttingDown = true;
-        this.removeFromRegistry();
+        this.markOfflineInRegistry();
         this.activeIntervals.forEach(clearInterval);
         this.log("WARN", "Extinguishing cell...");
         if (this.server) this.server.stop();
@@ -2060,7 +2103,8 @@ export class RheoCell {
             ) {
                 errorCode = "RPC_UNREACHABLE";
                 errorDetails.reason = "Target offline";
-                const targetId = signal.trace.length > 0 ? signal.trace[signal.trace.length - 1].split(':')[0] : 'unknown';
+                // Look up the actual target ID by matching the failing address in our atlas
+                const targetId = Object.entries(this.atlas).find(([_, e]) => e.addr === addr)?.[0] || 'unknown';
                 this.pruneDeadPeer(targetId);
             } else if (e.message?.includes('JSON')) {
                 errorCode = "RPC_PARSE_ERR";

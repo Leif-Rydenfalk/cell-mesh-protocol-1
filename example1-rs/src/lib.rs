@@ -124,6 +124,18 @@ pub fn get_registry_dir() -> String {
         .to_string()
 }
 
+pub fn get_identities_dir() -> String {
+    if let Ok(env_dir) = std::env::var("RHEO_IDENTITIES_DIR") {
+        return env_dir;
+    }
+
+    get_home_dir()
+        .join(".rheo")
+        .join("identities")
+        .to_string_lossy()
+        .to_string()
+}
+
 // ============================================================================
 // ERROR SYSTEM
 // ============================================================================
@@ -727,15 +739,41 @@ struct Metrics {
 impl RheoCell {
     /// Create a new cell with the given configuration
     pub fn new(config: CellConfig) -> Arc<Self> {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let verifying_key = VerifyingKey::from(&signing_key);
-        let pub_key_hex = hex::encode(verifying_key.to_bytes());
-
         let id = if config.id.is_empty() {
-            format!("cell_{}", &pub_key_hex[..16])
+            format!("cell_{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap())
         } else {
             config.id.clone()
         };
+
+        let identities_dir = std::path::PathBuf::from(get_identities_dir());
+        let _ = std::fs::create_dir_all(&identities_dir);
+        let id_file = identities_dir.join(format!("{}.json", id));
+
+        let (signing_key, verifying_key) = if let Ok(content) = std::fs::read_to_string(&id_file) {
+            // Load existing immortal identity
+            let keys: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+            let priv_hex = keys.get("privateKey").and_then(|v| v.as_str()).unwrap_or("");
+            let bytes = hex::decode(priv_hex).unwrap_or(vec![0; 32]);
+            let mut key_bytes = [0u8; 32];
+            key_bytes.copy_from_slice(&bytes[0..32.min(bytes.len())]);
+            let sk = SigningKey::from_bytes(&key_bytes);
+            let vk = VerifyingKey::from(&sk);
+            (sk, vk)
+        } else {
+            // Generate and save new immortal identity
+            let sk = SigningKey::generate(&mut OsRng);
+            let vk = VerifyingKey::from(&sk);
+            let priv_hex = hex::encode(sk.to_bytes());
+            let pub_hex = hex::encode(vk.to_bytes());
+            let json = serde_json::json!({
+                "privateKey": priv_hex,
+                "publicKey": pub_hex
+            });
+            let _ = std::fs::write(&id_file, json.to_string());
+            (sk, vk)
+        };
+
+        let pub_key_hex = hex::encode(verifying_key.to_bytes());
 
         let cell = Arc::new(Self {
             id: id.clone(),
@@ -789,6 +827,26 @@ impl RheoCell {
             "Gossip args don't match expected format. Keys: {:?}",
             args.as_object().map(|o| o.keys().collect::<Vec<_>>())
         ))
+    }
+
+    async fn register_to_registry(&self) {
+        if let Some(dir) = &self.config.registry_dir {
+            if let Some(mut entry) = self.atlas.get_mut(&self.id) {
+                // Determine status based on shutdown flag
+                if self.is_shutting_down.load(Ordering::SeqCst) > 0 {
+                    entry.status = "offline".to_string();
+                } else {
+                    entry.status = "online".to_string();
+                }
+                entry.last_seen = now_millis();
+                
+                let path = std::path::PathBuf::from(dir).join(format!("{}.json", self.id));
+                if let Ok(json) = serde_json::to_string_pretty(&*entry) {
+                    let _ = tokio::fs::create_dir_all(dir).await;
+                    let _ = tokio::fs::write(path, json).await;
+                }
+            }
+        }
     }
 
     fn register_default_handlers(self: &Arc<Self>) {
@@ -984,6 +1042,7 @@ impl RheoCell {
         )
         .with_pub_key(self.pub_key_hex.clone());
         self.atlas.insert(self.id.clone(), self_entry);
+        self.register_to_registry().await;
 
         // Start background tasks
         self.start_background_tasks().await;
@@ -1063,6 +1122,20 @@ impl RheoCell {
             }
         });
         self.tasks.lock().await.push(cleanup_handle);
+
+        // Heartbeat task (registry update)
+        let cell = Arc::clone(self);
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if cell.is_shutting_down.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                cell.register_to_registry().await;
+            }
+        });
+        self.tasks.lock().await.push(heartbeat_handle);
 
         // Bootstrap from seed if provided
         if let Some(seed) = &self.config.seed {
@@ -1749,6 +1822,10 @@ impl RheoCell {
         }
 
         self.is_shutting_down.store(2, Ordering::SeqCst);
+
+        // Mark as offline in the registry instead of removing it
+        self.register_to_registry().await;
+
         info!(cell_id = %self.id, "Shutdown complete");
     }
 

@@ -81,16 +81,16 @@ class ZodString extends ZodType<string> {
     }
 
     parse(val: unknown): string {
-        const withDefault = this.applyDefault(val);
-        if (withDefault !== undefined) return withDefault;
-        if (typeof val !== 'string') throw new Error('Expected string');
-        if (this._min !== undefined && val.length < this._min) {
+        const parsed = this.applyDefault(val);
+        if (parsed === undefined) throw new Error('Expected string');
+        if (typeof parsed !== 'string') throw new Error('Expected string');
+        if (this._min !== undefined && parsed.length < this._min) {
             throw new Error(`String too short (min ${this._min})`);
         }
-        if (this._max !== undefined && val.length > this._max) {
+        if (this._max !== undefined && parsed.length > this._max) {
             throw new Error(`String too long (max ${this._max})`);
         }
-        return val;
+        return parsed;
     }
 
     min(n: number): this {
@@ -114,16 +114,16 @@ class ZodNumber extends ZodType<number> {
     }
 
     parse(val: unknown): number {
-        const withDefault = this.applyDefault(val);
-        if (withDefault !== undefined) return withDefault;
-        if (typeof val !== 'number') throw new Error('Expected number');
-        if (this._min !== undefined && val < this._min) {
+        const parsed = this.applyDefault(val);
+        if (parsed === undefined) throw new Error('Expected number');
+        if (typeof parsed !== 'number') throw new Error('Expected number');
+        if (this._min !== undefined && parsed < this._min) {
             throw new Error(`Number too small (min ${this._min})`);
         }
-        if (this._max !== undefined && val > this._max) {
+        if (this._max !== undefined && parsed > this._max) {
             throw new Error(`Number too large (max ${this._max})`);
         }
-        return val;
+        return parsed;
     }
 
     min(n: number): this {
@@ -144,10 +144,10 @@ class ZodBoolean extends ZodType<boolean> {
     }
 
     parse(val: unknown): boolean {
-        const withDefault = this.applyDefault(val);
-        if (withDefault !== undefined) return withDefault;
-        if (typeof val !== 'boolean') throw new Error('Expected boolean');
-        return val;
+        const parsed = this.applyDefault(val);
+        if (parsed === undefined) throw new Error('Expected boolean');
+        if (typeof parsed !== 'boolean') throw new Error('Expected boolean');
+        return parsed;
     }
 }
 

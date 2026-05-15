@@ -19,7 +19,8 @@ if (typeof window !== 'undefined') {
         },
         sign: () => Buffer.from('dummy'),
         verify: () => true,
-        createPublicKey: (key: string) => ({ export: () => key })
+        createPublicKey: (key: string) => ({ export: () => key }),
+        createPrivateKey: (key: string) => ({ export: () => key })
     };
 
     const globalCrypto = (globalThis as any).crypto || {};
