@@ -94,10 +94,30 @@ pub fn get_protocols_dir() -> PathBuf {
     panic!("Could not find protocols/ directory. Is the workspace structure correct?");
 }
 
+// ============================================================================
+// REGISTRY PATH HELPERS
+// ============================================================================
+
+/// Get the user's home directory across platforms
+pub fn get_home_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home)
+    } else if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        PathBuf::from(user_profile)
+    } else {
+        // Fallback if home directory cannot be determined
+        PathBuf::from("/tmp")
+    }
+}
+
 /// Get the standard registry directory path
-/// Returns: <protocols>/.rheo/registry (matching TypeScript cells)
+/// Returns: ~/.rheo/registry (or RHEO_REGISTRY_DIR if set)
 pub fn get_registry_dir() -> String {
-    get_protocols_dir()
+    if let Ok(env_dir) = std::env::var("RHEO_REGISTRY_DIR") {
+        return env_dir;
+    }
+
+    get_home_dir()
         .join(".rheo")
         .join("registry")
         .to_string_lossy()
