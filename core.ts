@@ -1346,13 +1346,6 @@ export class RheoCell {
         } catch (e) { }
     }
 
-    private pruneDeadPeer(peerId: string) {
-        if (this.atlas[peerId]) {
-            this.atlas[peerId].status = 'offline';
-            this.log("WARN", `🔻 Marked ${peerId} as offline`);
-        }
-    }
-
     public async bootstrapFromRegistry(forceAll = false) {
         try {
             const files = readdirSync(REGISTRY_DIR).filter(f => f.endsWith('.json') && f !== `${this.id}.json`);
@@ -2103,9 +2096,14 @@ export class RheoCell {
             ) {
                 errorCode = "RPC_UNREACHABLE";
                 errorDetails.reason = "Target offline";
-                // Look up the actual target ID by matching the failing address in our atlas
                 const targetId = Object.entries(this.atlas).find(([_, e]) => e.addr === addr)?.[0] || 'unknown';
-                this.pruneDeadPeer(targetId);
+                if (targetId !== 'unknown') {
+                    const entry = this.atlas[targetId];
+                    if (entry && entry.status !== 'offline') {
+                        entry.status = 'offline';
+                        this.log("WARN", `🔻 Marked ${targetId} as offline`);
+                    }
+                }
             } else if (e.message?.includes('JSON')) {
                 errorCode = "RPC_PARSE_ERR";
                 errorDetails.reason = "Invalid JSON response";
@@ -2287,8 +2285,11 @@ export class RheoCell {
             const existing = this.atlas[cellId];
 
             // STALENESS CHECK: Ignore entries older than 30 seconds
-            if (now - entry.lastSeen > 30000) {
-                if (existing && existing.addr === entry.addr) delete this.atlas[cellId];
+            if (now - entry.lastSeen > 60000) {
+                if (existing && existing.status !== 'offline') {
+                    existing.status = 'offline';
+                    this.log("DEBUG", `💤 Marked ${cellId} as offline (stale)`);
+                }
                 continue;
             }
 
