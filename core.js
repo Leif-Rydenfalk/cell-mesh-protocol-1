@@ -674,6 +674,9 @@ export class RheoCell {
     journal = {};
     rollingJournal = [];
     MAX_JOURNAL_SIZE = 100;
+    // PubSub for capabilities
+    capabilityWaiters = new Map();
+    fsWatcher = null;
     _addr = "";
     get addr() {
         return this._addr;
@@ -755,22 +758,52 @@ export class RheoCell {
         this.id = id;
         this.port = port;
         this.seed = seed;
-        if (process.env.RHEO_CELL_ID)
+        if (process.env.RHEO_CELL_ID) {
             this.id = process.env.RHEO_CELL_ID;
+        }
+        else {
+            // FIX: Strip _PID if run manually so cells reuse the same ID and registry file
+            this.id = this.id.replace(/_\d+$/, '');
+        }
         this.cellDir = process.cwd();
         // 2. LOCAL MANIFESTS: Keep process tracking local to where you run the script
         const manifestDir = join(process.cwd(), ".rheo", "manifests");
         if (!existsSync(manifestDir))
             mkdirSync(manifestDir, { recursive: true });
         this.manifestPath = join(manifestDir, `${this.id}.cell.json`);
-        // --- IDENTITY GENERATION (Session-based Ed25519) ---
-        // Generate Identity with explicit Ed25519
-        // Remove the encoding options to get KeyObjects
-        const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-        this.privateKey = privateKey; // This is a KeyObject
-        this.publicKey = publicKey.export({ type: 'spki', format: 'pem' }); // Export as PEM string
+        // --- IMMORTAL IDENTITY GENERATION (Ed25519) ---
+        const IDENTITIES_DIR = process.env.RHEO_IDENTITIES_DIR || join(homedir(), ".rheo", "identities");
+        if (!existsSync(IDENTITIES_DIR))
+            mkdirSync(IDENTITIES_DIR, { recursive: true });
+        const identityFile = join(IDENTITIES_DIR, `${this.id}.json`);
+        if (existsSync(identityFile)) {
+            // Reuse existing identity
+            const keys = JSON.parse(readFileSync(identityFile, 'utf8'));
+            const { createPrivateKey } = require('node:crypto');
+            this.privateKey = createPrivateKey(keys.privateKey);
+            this.publicKey = keys.publicKey;
+        }
+        else {
+            // Generate and save new immortal identity
+            const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+            this.privateKey = privateKey;
+            this.publicKey = publicKey.export({ type: 'spki', format: 'pem' });
+            const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+            writeFileSync(identityFile, JSON.stringify({
+                publicKey: this.publicKey,
+                privateKey: privPem
+            }, null, 2));
+        }
         // Log key fingerprint for debugging
-        const pubKeyBuffer = publicKey.export({ type: 'spki', format: 'der' });
+        let pubKeyObject;
+        if (this.publicKey) {
+            pubKeyObject = createPublicKey(this.publicKey);
+        }
+        else {
+            // Should not happen, but fallback (generate temporary)
+            pubKeyObject = generateKeyPairSync('ed25519').publicKey;
+        }
+        const pubKeyBuffer = pubKeyObject.export({ type: 'spki', format: 'der' });
         const fingerprint = createHash('sha256').update(pubKeyBuffer).digest('hex').substring(0, 16);
         console.log(`[${this.id}] Key fingerprint: ${fingerprint}`);
         // Only reuse port from manifest if explicitly allowed
@@ -894,34 +927,41 @@ export class RheoCell {
             addr: this.addr,
             caps: Object.keys(this.handlers),
             pubKey: this.publicKey,
+            firstSeen: this.atlas[this.id]?.firstSeen || Date.now(),
             lastSeen: Date.now(),
             lastGossiped: Date.now(),
-            gossipHopCount: 0
+            gossipHopCount: 0,
+            status: 'online'
         };
         try {
             writeFileSync(join(REGISTRY_DIR, `${this.id}.json`), JSON.stringify(entry));
         }
         catch (e) { }
     }
-    removeFromRegistry() {
+    markOfflineInRegistry() {
         try {
-            const file = join(REGISTRY_DIR, `${this.id}.json`);
-            if (existsSync(file))
-                unlinkSync(file);
+            if (!this.addr)
+                return;
+            const entry = {
+                id: this.id,
+                addr: this.addr,
+                caps: Object.keys(this.handlers),
+                pubKey: this.publicKey,
+                firstSeen: this.atlas[this.id]?.firstSeen || Date.now(),
+                lastSeen: Date.now(),
+                lastGossiped: Date.now(),
+                gossipHopCount: 0,
+                status: 'offline'
+            };
+            writeFileSync(join(REGISTRY_DIR, `${this.id}.json`), JSON.stringify(entry));
         }
         catch (e) { }
     }
     pruneDeadPeer(peerId) {
-        // 1. Remove from local memory
-        delete this.atlas[peerId];
-        // 2. Remove from shared disk registry (Self-Healing)
-        // This stops other cells from discovering this dead peer
-        try {
-            const file = join(REGISTRY_DIR, `${peerId}.json`);
-            if (existsSync(file))
-                unlinkSync(file);
+        if (this.atlas[peerId]) {
+            this.atlas[peerId].status = 'offline';
+            this.log("WARN", `🔻 Marked ${peerId} as offline`);
         }
-        catch (e) { }
     }
     async bootstrapFromRegistry(forceAll = false) {
         try {
@@ -1079,7 +1119,7 @@ export class RheoCell {
         if (this.isShuttingDown)
             return { ok: true, cid: randomUUID() };
         this.isShuttingDown = true;
-        this.removeFromRegistry();
+        this.markOfflineInRegistry();
         this.activeIntervals.forEach(clearInterval);
         this.log("WARN", "Extinguishing cell...");
         if (this.server)
@@ -1109,52 +1149,115 @@ export class RheoCell {
    * This handles the race condition where cells are still registering
    * when the first request comes in.
    */
+    // public async askMesh(
+    //     capability: string,
+    //     args: any = {},
+    //     proofs: Record<string, string> = {},
+    //     options: {
+    //         maxWaitMs?: number;
+    //         baseDelayMs?: number;
+    //         maxDelayMs?: number;
+    //         atlasRefreshIntervalMs?: number;
+    //     } = {}
+    // ): Promise<TraceResult> {
+    //     const {
+    //         maxWaitMs = 30000,
+    //         baseDelayMs = 100,
+    //         maxDelayMs = 5000,
+    //         atlasRefreshIntervalMs = 1000
+    //     } = options;
+    //     const startTime = Date.now();
+    //     let attempt = 0;
+    //     let lastAtlasRefresh = 0;
+    //     while (true) {
+    //         const signal: Signal = {
+    //             id: randomUUID(),
+    //             from: this.id,
+    //             intent: "ASK",
+    //             payload: { capability, args },
+    //             proofs,
+    //             atlas: this.atlas,
+    //             trace: [],
+    //             _steps: []
+    //         };
+    //         const result = await this.route(signal);
+    //         // Success? Return immediately
+    //         if (result.ok) {
+    //             if (attempt > 0) {
+    //                 this.log("INFO", `✅ [${capability}] succeeded after ${attempt + 1} attempts (${Date.now() - startTime}ms)`);
+    //             }
+    //             return result;
+    //         }
+    //         // Not a NOT_FOUND error? Don't retry
+    //         if (result.error?.code !== "NOT_FOUND") {
+    //             return result;
+    //         }
+    //         // Check timeout
+    //         const elapsed = Date.now() - startTime;
+    //         if (elapsed >= maxWaitMs) {
+    //             this.log("WARN", `⏰ [${capability}] discovery timeout after ${maxWaitMs}ms, ${attempt + 1} attempts`);
+    //             return result;
+    //         }
+    //         // Calculate backoff delay
+    //         const delay = Math.min(
+    //             baseDelayMs * Math.pow(2, attempt),
+    //             maxDelayMs
+    //         );
+    //         // Check if we should refresh atlas
+    //         if (elapsed - lastAtlasRefresh >= atlasRefreshIntervalMs) {
+    //             this.log("DEBUG", `🔄 [${capability}] refreshing atlas (attempt ${attempt + 1}, ${elapsed}ms elapsed)`);
+    //             await this.bootstrapFromRegistry(true);
+    //             lastAtlasRefresh = elapsed;
+    //         }
+    //         attempt++;
+    //         this.log("DEBUG", `⏳ [${capability}] retry ${attempt} in ${delay}ms (${elapsed}ms elapsed)`);
+    //         await new Promise(r => setTimeout(r, delay));
+    //     }
+    // }
     async askMesh(capability, args = {}, proofs = {}, options = {}) {
-        const { maxWaitMs = 30000, baseDelayMs = 100, maxDelayMs = 5000, atlasRefreshIntervalMs = 1000 } = options;
-        const startTime = Date.now();
-        let attempt = 0;
-        let lastAtlasRefresh = 0;
-        while (true) {
-            const signal = {
-                id: randomUUID(),
-                from: this.id,
-                intent: "ASK",
-                payload: { capability, args },
-                proofs,
-                atlas: this.atlas,
-                trace: [],
-                _steps: []
-            };
-            const result = await this.route(signal);
-            // Success? Return immediately
-            if (result.ok) {
-                if (attempt > 0) {
-                    this.log("INFO", `✅ [${capability}] succeeded after ${attempt + 1} attempts (${Date.now() - startTime}ms)`);
-                }
-                return result;
-            }
-            // Not a NOT_FOUND error? Don't retry
-            if (result.error?.code !== "NOT_FOUND") {
-                return result;
-            }
-            // Check timeout
-            const elapsed = Date.now() - startTime;
-            if (elapsed >= maxWaitMs) {
-                this.log("WARN", `⏰ [${capability}] discovery timeout after ${maxWaitMs}ms, ${attempt + 1} attempts`);
-                return result;
-            }
-            // Calculate backoff delay
-            const delay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
-            // Check if we should refresh atlas
-            if (elapsed - lastAtlasRefresh >= atlasRefreshIntervalMs) {
-                this.log("DEBUG", `🔄 [${capability}] refreshing atlas (attempt ${attempt + 1}, ${elapsed}ms elapsed)`);
-                await this.bootstrapFromRegistry(true);
-                lastAtlasRefresh = elapsed;
-            }
-            attempt++;
-            this.log("DEBUG", `⏳ [${capability}] retry ${attempt} in ${delay}ms (${elapsed}ms elapsed)`);
-            await new Promise(r => setTimeout(r, delay));
+        const { maxWaitMs = 30000 } = options;
+        const signal = {
+            id: randomUUID(),
+            from: this.id,
+            intent: "ASK",
+            payload: { capability, args },
+            proofs,
+            atlas: this.atlas,
+            trace: [],
+            _steps: []
+        };
+        // Try immediately
+        let result = await this.route(signal);
+        if (result.ok || result.error?.code !== "NOT_FOUND")
+            return result;
+        // If not found, check if we know an OFFLINE cell that has it
+        const offlineProvider = Object.values(this.atlas).find(e => e.status === 'offline' && e.caps.includes(capability));
+        if (offlineProvider) {
+            this.log("DEBUG", `[${capability}] Found offline provider ${offlineProvider.id}, attempting to wake...`);
+            // Ping it directly to see if it resurrected
+            fetch(`${offlineProvider.addr}/atlas`, { method: "POST" }).catch(() => { });
         }
+        this.log("INFO", `⏳ Suspending execution. Waiting for [${capability}] to come online...`);
+        // Subscribe to the capability and go to sleep
+        return new Promise((resolve) => {
+            let timeoutId;
+            const wakeup = async () => {
+                clearTimeout(timeoutId);
+                const retryResult = await this.route(signal);
+                resolve(retryResult);
+            };
+            if (!this.capabilityWaiters.has(capability)) {
+                this.capabilityWaiters.set(capability, []);
+            }
+            this.capabilityWaiters.get(capability).push(wakeup);
+            // Timeout fallback
+            timeoutId = setTimeout(() => {
+                // Remove from waiters
+                const waiters = this.capabilityWaiters.get(capability) || [];
+                this.capabilityWaiters.set(capability, waiters.filter(w => w !== wakeup));
+                resolve(result); // Return the original NOT_FOUND error
+            }, maxWaitMs);
+        });
     }
     requestQueue = new Map();
     maxConcurrent = 50;
@@ -1515,7 +1618,8 @@ export class RheoCell {
                 e.message?.includes('Unable to connect')) {
                 errorCode = "RPC_UNREACHABLE";
                 errorDetails.reason = "Target offline";
-                const targetId = signal.trace.length > 0 ? signal.trace[signal.trace.length - 1].split(':')[0] : 'unknown';
+                // Look up the actual target ID by matching the failing address in our atlas
+                const targetId = Object.entries(this.atlas).find(([_, e]) => e.addr === addr)?.[0] || 'unknown';
                 this.pruneDeadPeer(targetId);
             }
             else if (e.message?.includes('JSON')) {
@@ -1716,12 +1820,25 @@ export class RheoCell {
                     addr: entry.addr, // Always use latest address
                     caps: entry.caps,
                     pubKey: entry.pubKey,
+                    firstSeen: existing?.firstSeen || now,
+                    status: 'online',
                     lastSeen: existing && existing.lastSeen > entry.lastSeen
                         ? existing.lastSeen // Keep our newer direct timestamp
                         : entry.lastSeen, // Or use theirs if newer
                     lastGossiped: now, // Always update this (internal bookkeeping)
                     gossipHopCount: Math.min((entry.gossipHopCount || 0) + 1, 3)
                 };
+                // Wake up any sleeping processes waiting for these capabilities
+                if (this.atlas[cellId].status === 'online') {
+                    for (const cap of this.atlas[cellId].caps) {
+                        if (this.capabilityWaiters.has(cap)) {
+                            this.log("INFO", `🔔 Waking up suspended processes waiting for [${cap}]`);
+                            const waiters = this.capabilityWaiters.get(cap);
+                            this.capabilityWaiters.delete(cap);
+                            waiters.forEach(w => w());
+                        }
+                    }
+                }
             }
             else {
                 // Direct contact - always authoritative
@@ -1739,6 +1856,8 @@ export class RheoCell {
                     addr: entry.addr,
                     caps: entry.caps,
                     pubKey: entry.pubKey,
+                    firstSeen: existing?.firstSeen || now,
+                    status: 'online',
                     lastSeen: now, // Direct contact = fresh
                     lastGossiped: now,
                     gossipHopCount: 0
@@ -1753,6 +1872,8 @@ export class RheoCell {
                 addr: myAddr,
                 caps: Object.keys(this.handlers),
                 pubKey: this.publicKey,
+                firstSeen: this.atlas[this.id]?.firstSeen || now,
+                status: 'online',
                 lastSeen: now,
                 lastGossiped: now,
                 gossipHopCount: 0
@@ -1785,9 +1906,10 @@ export class RheoCell {
         for (const [id, entry] of Object.entries(this.atlas)) {
             if (id === this.id)
                 continue;
-            if (now - entry.lastSeen > 60000) { // 60 second timeout
-                delete this.atlas[id];
-                this.log("INFO", `🧹 Cleaned stale entry: ${id}`);
+            // 60 second timeout -> mark offline, DO NOT delete
+            if (entry.status === 'online' && now - entry.lastSeen > 60000) {
+                entry.status = 'offline';
+                this.log("DEBUG", `💤 Marked inactive cell as offline: ${id}`);
             }
         }
     }
@@ -1965,12 +2087,48 @@ export class RheoCell {
         // Ensure we are the first entry in our own Atlas.
         this.atlas[this.id] = {
             id: this.id, addr: this._addr, caps: Object.keys(this.handlers),
-            pubKey: this.publicKey, lastSeen: Date.now(),
+            pubKey: this.publicKey,
+            firstSeen: Date.now(),
+            status: 'online',
+            lastSeen: Date.now(),
             lastGossiped: Date.now(), gossipHopCount: 0
         };
         // --- DECENTRALIZED REGISTRY BOOTSTRAP ---
         this.registerToRegistry();
         this.bootstrapFromRegistry().catch(() => { });
+        // --- 1. OS-LEVEL FILESYSTEM PUBSUB ---
+        try {
+            import("node:fs").then(fs => {
+                this.fsWatcher = fs.watch(REGISTRY_DIR, (eventType, filename) => {
+                    if (filename && filename.endsWith('.json')) {
+                        try {
+                            const content = fs.readFileSync(join(REGISTRY_DIR, filename), 'utf8');
+                            const entry = JSON.parse(content);
+                            entry.status = 'online';
+                            entry.lastSeen = Date.now();
+                            entry.firstSeen = entry.firstSeen || Date.now();
+                            this.mergeAtlas({ [entry.id]: entry }, false, 0);
+                        }
+                        catch (e) { } // File might be half-written or deleted, safe to ignore
+                    }
+                });
+            });
+        }
+        catch (e) { }
+        // --- 2. IMMORTAL RESURRECTION PING ---
+        // Every hour, check on dead cells to see if they came back
+        const resurrectionPing = setInterval(() => {
+            const now = Date.now();
+            const deadCells = Object.values(this.atlas).filter(e => e.status === 'offline' && (now - e.lastSeen > 3600000) // 1 hour
+            );
+            if (deadCells.length > 0) {
+                // Pick one random dead cell and ping it
+                const target = deadCells[Math.floor(Math.random() * deadCells.length)];
+                fetch(`${target.addr}/atlas`, { method: "POST", signal: AbortSignal.timeout(1000) })
+                    .catch(() => { });
+            }
+        }, 60000); // Check once a minute
+        this.activeIntervals.push(resurrectionPing);
         // Heartbeat: Update registry file every 5s to stay "alive"
         const heartbeat = setInterval(() => this.registerToRegistry(), 5000);
         this.activeIntervals.push(heartbeat);
@@ -1983,6 +2141,8 @@ export class RheoCell {
                 addr: this._addr,
                 caps: Object.keys(this.handlers),
                 pubKey: this.publicKey,
+                firstSeen: Date.now(),
+                status: 'online',
                 lastSeen: Date.now(),
                 lastGossiped: Date.now(),
                 gossipHopCount: 0

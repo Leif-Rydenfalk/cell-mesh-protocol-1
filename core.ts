@@ -2392,6 +2392,8 @@ export class RheoCell {
                     addr: entry.addr,
                     caps: entry.caps,
                     pubKey: entry.pubKey,
+                    firstSeen: existing?.firstSeen || now,
+                    status: 'online',
                     lastSeen: now,  // Direct contact = fresh
                     lastGossiped: now,
                     gossipHopCount: 0
@@ -2407,6 +2409,8 @@ export class RheoCell {
                 addr: myAddr,
                 caps: Object.keys(this.handlers),
                 pubKey: this.publicKey,
+                firstSeen: this.atlas[this.id]?.firstSeen || now,
+                status: 'online',
                 lastSeen: now,
                 lastGossiped: now,
                 gossipHopCount: 0
@@ -2647,7 +2651,10 @@ export class RheoCell {
         // Ensure we are the first entry in our own Atlas.
         this.atlas[this.id] = {
             id: this.id, addr: this._addr, caps: Object.keys(this.handlers),
-            pubKey: this.publicKey, lastSeen: Date.now(),
+            pubKey: this.publicKey,
+            firstSeen: Date.now(),
+            status: 'online',
+            lastSeen: Date.now(),
             lastGossiped: Date.now(), gossipHopCount: 0
         };
 
@@ -2704,11 +2711,12 @@ export class RheoCell {
                 addr: this._addr,
                 caps: Object.keys(this.handlers),
                 pubKey: this.publicKey,
+                firstSeen: Date.now(),
+                status: 'online',
                 lastSeen: Date.now(),
                 lastGossiped: Date.now(),
                 gossipHopCount: 0
             };
-
 
             const targets = Object.values(this.atlas)
                 .filter(e =>

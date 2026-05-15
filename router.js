@@ -34,18 +34,18 @@ class ZodString extends ZodType {
         this._def.typeName = "ZodString";
     }
     parse(val) {
-        const withDefault = this.applyDefault(val);
-        if (withDefault !== undefined)
-            return withDefault;
-        if (typeof val !== 'string')
+        const parsed = this.applyDefault(val);
+        if (parsed === undefined)
             throw new Error('Expected string');
-        if (this._min !== undefined && val.length < this._min) {
+        if (typeof parsed !== 'string')
+            throw new Error('Expected string');
+        if (this._min !== undefined && parsed.length < this._min) {
             throw new Error(`String too short (min ${this._min})`);
         }
-        if (this._max !== undefined && val.length > this._max) {
+        if (this._max !== undefined && parsed.length > this._max) {
             throw new Error(`String too long (max ${this._max})`);
         }
-        return val;
+        return parsed;
     }
     min(n) {
         this._min = n;
@@ -64,18 +64,18 @@ class ZodNumber extends ZodType {
         this._def.typeName = "ZodNumber";
     }
     parse(val) {
-        const withDefault = this.applyDefault(val);
-        if (withDefault !== undefined)
-            return withDefault;
-        if (typeof val !== 'number')
+        const parsed = this.applyDefault(val);
+        if (parsed === undefined)
             throw new Error('Expected number');
-        if (this._min !== undefined && val < this._min) {
+        if (typeof parsed !== 'number')
+            throw new Error('Expected number');
+        if (this._min !== undefined && parsed < this._min) {
             throw new Error(`Number too small (min ${this._min})`);
         }
-        if (this._max !== undefined && val > this._max) {
+        if (this._max !== undefined && parsed > this._max) {
             throw new Error(`Number too large (max ${this._max})`);
         }
-        return val;
+        return parsed;
     }
     min(n) {
         this._min = n;
@@ -92,12 +92,12 @@ class ZodBoolean extends ZodType {
         this._def.typeName = "ZodBoolean";
     }
     parse(val) {
-        const withDefault = this.applyDefault(val);
-        if (withDefault !== undefined)
-            return withDefault;
-        if (typeof val !== 'boolean')
+        const parsed = this.applyDefault(val);
+        if (parsed === undefined)
             throw new Error('Expected boolean');
-        return val;
+        if (typeof parsed !== 'boolean')
+            throw new Error('Expected boolean');
+        return parsed;
     }
 }
 class ZodLiteral extends ZodType {
