@@ -446,18 +446,27 @@ export class Router<TProcedures extends Record<string, AnyProcedure | AnyRouter>
      */
     findProcedure(capability: string): AnyProcedure | null {
         const parts = capability.split('/');
-        let current: AnyProcedure | AnyRouter | undefined = undefined;
-        let currentProcs: Record<string, AnyProcedure | AnyRouter> = this._def.procedures;
+        let current: AnyProcedure | AnyRouter | undefined = this;
+        let currentProcs = this._def.procedures;
 
-        for (const part of parts) {
-            current = currentProcs[part];
-            if (!current) return null;
+        for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            const next = currentProcs[part];
+            if (!next) return null;
 
-            if (current instanceof Router) {
-                currentProcs = current._def.procedures;
+            if (next instanceof Router) {
+                // For the last part, treat the remaining as a single key? No, we continue segment by segment.
+                // But if the next is a Router, we set current and continue.
+                current = next;
+                currentProcs = (next as Router<any>)._def.procedures;
+            } else if (next instanceof Procedure) {
+                // If this is the last part, return the procedure
+                if (i === parts.length - 1) return next;
+                else return null; // premature procedure
+            } else {
+                return null;
             }
         }
-
         return current instanceof Procedure ? current : null;
     }
 
