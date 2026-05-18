@@ -2,6 +2,10 @@
 // Cell example protocol 1
 // Optimized for Trading Platforms: Low Latency, High Throughput, Zero-Copy
 
+//! Rheo Cell Mesh Protocol v1
+//! Typed RPC, capability discovery, and gossip for distributed cell networks
+
+
 #![allow(dead_code)]
 
 use std::{

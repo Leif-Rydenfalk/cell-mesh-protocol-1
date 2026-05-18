@@ -1,14 +1,14 @@
 # example1-rs/Cargo.toml
 [package]
-name = "cell-protocol-example1-rs"
+name = "cell_mesh_protocol_1"
 version = "0.1.0"
 edition = "2021"
-authors = ["OpenJaws Contributors"]
-description = "High-performance distributed mesh protocol for trading platforms"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/openjaws/rheo-mesh"
-keywords = ["distributed", "mesh", "trading", "p2p", "consensus"]
-categories = ["network-programming", "finance", "asynchronous"]
+authors = ["Leif Rydenfalk <your-email>"]
+description = "Rheo mesh protocol - typed RPC, discovery, and gossip for distributed cell networks"
+license = "MIT"
+repository = "https://github.com/Leif-Rydenfalk/cell-mesh-protocol-1"
+keywords = ["mesh", "rpc", "distributed", "actors", "protocol"]
+categories = ["network-programming", "asynchronous"]
 
 [features]
 default = ["full"]

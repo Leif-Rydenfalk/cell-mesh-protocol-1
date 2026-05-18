@@ -1,3 +1,172 @@
+# =============================================================================
+# OPENJAWS MESH - GITIGNORE
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MESH RUNTIME (Auto-generated / Ephemeral)
+# -----------------------------------------------------------------------------
+
+# Registry & runtime state
+.rheo/
+.rheo_pids
+.rheo_seed
+*.cell.json
+
+# Auto-generated type files (regenerated on mesh changes)
+mesh-types.d.ts
+.rheo/mesh-types.d.ts
+mesh-types-trigger
+src/lib/generated-mesh-types.ts
+
+# Log files (runtime artifacts)
+*.log
+logs/
+.rheo/logs/
+memory/*.json
+memory/temporal_memory.json
+memory/learned_patterns.json
+memory/memory_store.json
+log/mesh_audit.log
+
+# Data directories (runtime state)
+data/
+ai_workspace/
+temporal_memory.json
+learned_patterns.json
+
+# -----------------------------------------------------------------------------
+# NODE / BUN DEPENDENCIES
+# -----------------------------------------------------------------------------
+
 node_modules/
+bun.lockb
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# -----------------------------------------------------------------------------
+# BUILD OUTPUTS
+# -----------------------------------------------------------------------------
+
+# TypeScript compilation
 dist/
+build/
+*.tsbuildinfo
+
+# SvelteKit / Vite
+ui/.svelte-kit/
+ui/build/
+ui/dist/
+ui/.vercel/
+ui/.netlify/
+ui/package-lock.json
+ui/bun.lock
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENT & SECRETS
+# -----------------------------------------------------------------------------
+
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+secrets/
+
+# API keys (critical for ai-gemini)
+ai-gemini/.env
+**/.env.local
+
+# -----------------------------------------------------------------------------
+# EDITOR / IDE
+# -----------------------------------------------------------------------------
+
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-*
+
+# -----------------------------------------------------------------------------
+# TESTING & COVERAGE
+# -----------------------------------------------------------------------------
+
+coverage/
+.nyc_output/
+*.lcov
+
+# -----------------------------------------------------------------------------
+# TEMPORARY FILES
+# -----------------------------------------------------------------------------
+
+tmp/
+temp/
+*.tmp
+*.temp
+.cache/
+
+# -----------------------------------------------------------------------------
+# OS-SPECIFIC
+# -----------------------------------------------------------------------------
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.nfs*
+
+# -----------------------------------------------------------------------------
+# ALLOW (Explicit includes)
+# -----------------------------------------------------------------------------
+
+# Keep example configs
+!**/*.example
+!**/*.template
+
+# Keep documentation
+!docs/
+!**/*.md
+
+# Keep static assets
+!ui/static/
+!ui/static/**
+
+# Keep SVG grid (part of UI theme)
+!ui/static/grid.svg
+
+
+certs/
+/certs
+.pem
+*.pem
+
+.rheo/
+/.rheo
+.rheo
+*.log
+
+mesh-types.d.ts
+.mesh-types-trigger
+
+trash/
+/trash
+
+target/
+/target
+
 .env
