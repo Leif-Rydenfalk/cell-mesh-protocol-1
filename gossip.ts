@@ -107,6 +107,10 @@ export interface GossipRecord {
     lastGossiped: number;
     gossipHopCount: number;
     status: 'online' | 'offline';
+    // Dependency-resolution attribution (see ../DEPENDENCIES.md). Optional;
+    // gossiped transparently like every other field.
+    repo?: string;
+    repoVersion?: string;
     // SWIM membership overlay
     memberStatus: MemberStatus;
     version: number;        // Monotonic timestamp; higher = more recent knowledge

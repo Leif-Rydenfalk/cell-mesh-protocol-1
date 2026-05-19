@@ -35,11 +35,27 @@ Full test documentation: [`mesh1/cell-mesh-protocol-1-test/TESTS.md`](../../mesh
 ## Entry points
 
 ```
-core.ts        — RheoCell class, Signal routing, handleShutdown, askMesh, atlas
-typed-mesh.ts  — TypedRheoCell, createMeshProxy (cell.mesh.X.Y() ergonomics)
-router.ts      — router(), procedure(), z — schema and procedure definitions
-index.ts       — re-exports everything
+core.ts         — RheoCell class, Signal routing, handleShutdown, askMesh, atlas
+typed-mesh.ts   — TypedRheoCell, createMeshProxy (cell.mesh.X.Y() ergonomics)
+router.ts       — router(), procedure(), z — schema and procedure definitions
+dependencies.ts — DRAFT: types + pure helpers for cell-to-cell repo deps
+                  (see DEPENDENCIES.md). Not yet wired into RheoCell.
+index.ts        — re-exports everything
 ```
+
+## Cell dependencies (draft)
+
+`DEPENDENCIES.md` describes a protocol addition that lets a cell declare other cells
+it needs (by source repo) and have the mesh resolve them via gossip + on-demand spawn.
+`dependencies.ts` carries the types and pure helpers; runtime wiring into `RheoCell`
+(extending `AtlasEntry`, adding `cell.deps`, hooking `gossip.subscribe` for re-resolution)
+is **not** implemented yet. Read `DEPENDENCIES.md` before adding any of:
+
+- new fields on `AtlasEntry`
+- new gossip message kinds
+- new env vars prefixed `RHEO_DEP_*`
+
+so the spec and the implementation stay in sync.
 
 ## Shutdown flow
 

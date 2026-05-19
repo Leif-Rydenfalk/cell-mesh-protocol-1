@@ -21,6 +21,19 @@ import { spawn } from "node:child_process";
 import { loadavg, homedir } from "node:os";
 import { createReadStream } from "node:fs";
 import { GossipRegistry, ConsistentHashRing, type GossipRecord } from "./gossip.ts";
+import {
+    loadCellSourceManifest,
+    parseDependencyRef,
+    findCandidates,
+    defaultAlias,
+    validateAliases,
+    satisfiesVersion,
+    type CellSourceManifest,
+    type CellDependencyDeclaration,
+    type ResolvedDependency,
+    type UnresolvedDependency,
+    type DependencyDeathHook,
+} from "./dependencies";
 
 const currentDir = dirname(new URL(import.meta.url).pathname);
 const cellsRoot = resolve(currentDir, ".."); // ../ from app/
@@ -166,6 +179,13 @@ export interface AtlasEntry {
     lastGossiped: number;    // When we last forwarded this entry
     gossipHopCount: number;  // How many hops from source (for TTL)
     status: 'online' | 'offline'; // State tracking
+    // --- Dependency resolution fields (see DEPENDENCIES.md). Optional; populated
+    // when a cell's Cell.toml declares [meta].repo. Existing cells without this
+    // metadata gossip these as undefined and remain fully backwards-compatible.
+    // Note: named `repoVersion` (not `version`) because GossipRecord already
+    // uses `version` for its internal monotonic timestamp.
+    repo?: string;          // canonical "github:OWNER/REPO" from Cell.toml meta.repo
+    repoVersion?: string;   // from Cell.toml meta.version
 }
 
 export interface TraceError {
@@ -1354,9 +1374,199 @@ export class RheoCell {
     private activeIntervals: Timer[] = [];
     private cleanupHooks: Array<() => void | Promise<void>> = [];
 
+    // --- Dependency resolution (see DEPENDENCIES.md). Populated at startup
+    // from Cell.toml; resolveDependencies() fills this.deps and resolves
+    // this.depsReady once required deps are satisfied (or the optional ones
+    // have given up). Cells that need a dep should `await cell.depsReady`.
+    public sourceManifest: CellSourceManifest | null = null;
+    public deps: Record<string, ResolvedDependency> = {};
+    public unresolvedDeps: Record<string, UnresolvedDependency> = {};
+    /**
+     * Resolves once resolveDependencies() finishes (success or required-failure).
+     * Cells that need a dep should `await cell.depsReady` before touching it.
+     * The promise resolves once — re-resolution after a dep dies does not
+     * re-arm it; consumers should check `cell.deps[alias]` for current state.
+     */
+    public depsReady: Promise<void>;
+    private depsReadyResolve!: () => void;
+    private depsReadySettled = false;
+    private dependencyDeathHooks: Map<string, DependencyDeathHook[]> = new Map();
+
     /** Register a setInterval handle to be cleared on cell shutdown. */
     public registerInterval(interval: Timer): void {
         this.activeIntervals.push(interval);
+    }
+
+    /**
+     * Subscribe to a dependency death. Fires when the previously-resolved
+     * instance backing `alias` is marked dead by gossip. The cell remains
+     * responsible for deciding what to do (re-resolve, drain, exit).
+     */
+    public onDependencyDeath(alias: string, hook: DependencyDeathHook): void {
+        const list = this.dependencyDeathHooks.get(alias) ?? [];
+        list.push(hook);
+        this.dependencyDeathHooks.set(alias, list);
+    }
+
+    /**
+     * Fires when gossip declares a peer dead. Looks up any resolved deps
+     * backed by that peer and triggers their death hooks. Wired into
+     * gossip.subscribe by completeListenSetup; do not call directly.
+     */
+    private _handleGossipDead(id: string): void {
+        for (const [alias, resolved] of Object.entries(this.deps)) {
+            if (resolved.id !== id) continue;
+            const hooks = this.dependencyDeathHooks.get(alias) ?? [];
+            const prior = { ...resolved };
+            // Remove from resolved set so cells don't accidentally keep routing
+            // to a dead instance. Cells can re-resolve via resolveDependencies()
+            // if they want auto-healing.
+            delete this.deps[alias];
+            for (const hook of hooks) {
+                Promise.resolve()
+                    .then(() => hook(alias, prior))
+                    .catch(e => this.log("WARN", `dependency-death hook for "${alias}" threw: ${e?.message ?? e}`));
+            }
+        }
+    }
+
+    /**
+     * Resolve all dependencies declared in Cell.toml. Populates cell.deps,
+     * cell.unresolvedDeps, and ultimately resolves cell.depsReady.
+     *
+     * Called once from completeListenSetup after gossip has started.
+     * Idempotent: running again re-resolves from the current gossip snapshot,
+     * which is the recommended way to recover after a dep dies.
+     */
+    public async resolveDependencies(): Promise<void> {
+        const deps = this.sourceManifest?.dependencies ?? [];
+        if (deps.length === 0) {
+            this.depsReadyResolve();
+            return;
+        }
+
+        const maxWaitMs = Number(process.env.RHEO_DEP_RESOLVE_MS ?? 60000);
+        const requiredFailures: string[] = [];
+
+        const resolveOne = async (dep: CellDependencyDeclaration): Promise<void> => {
+            const alias = dep.alias ?? defaultAlias(dep.ref);
+            let parsed;
+            try {
+                parsed = parseDependencyRef(dep.ref);
+            } catch (e: any) {
+                this.unresolvedDeps[alias] = {
+                    alias, ref: dep.ref, version: dep.version,
+                    reason: "no-match", detail: e?.message ?? String(e),
+                };
+                if (!dep.optional) requiredFailures.push(alias);
+                return;
+            }
+
+            if (parsed.kind === "local") {
+                if (process.env.RHEO_DEV_MODE !== "1") {
+                    this.unresolvedDeps[alias] = {
+                        alias, ref: dep.ref, version: dep.version,
+                        reason: "local-on-remote",
+                        detail: "local: refs require RHEO_DEV_MODE=1",
+                    };
+                    if (!dep.optional) requiredFailures.push(alias);
+                    return;
+                }
+                // In dev mode we don't run the dep — caller's responsibility.
+                this.deps[alias] = {
+                    alias, ref: dep.ref, id: alias, addr: parsed.target,
+                    version: dep.version, source: "local",
+                };
+                return;
+            }
+
+            // Try the live atlas first.
+            const live = this.gossip.liveAtlas() as unknown as Record<string, AtlasEntry>;
+            const candidates = findCandidates(dep, live);
+            if (candidates.length > 0) {
+                const pick = candidates[0];
+                this.deps[alias] = {
+                    alias, ref: dep.ref, id: pick.id, addr: pick.entry.addr,
+                    version: pick.entry.repoVersion,
+                    source: "reused",
+                };
+                return;
+            }
+
+            // Fire-and-forget spawn request. If no cell exposes mesh.spawn,
+            // this fails immediately with NOT_FOUND and we just wait for a
+            // matching cell to appear by some other means (manual start,
+            // future cell-spawner). The wait below is the actual blocking path.
+            this.askMesh(
+                "mesh.spawn",
+                { ref: dep.ref, version: dep.version, requestedBy: this.id },
+                {},
+                { maxWaitMs: 0 },
+            ).catch(() => { /* expected when no spawner present */ });
+
+            // Wait for a matching cell to appear via gossip.
+            const appeared = await new Promise<{ id: string; entry: AtlasEntry } | null>(resolve => {
+                let settled = false;
+                const timer = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(null);
+                }, maxWaitMs);
+
+                const recheck = () => {
+                    if (settled) return;
+                    const now = this.gossip.liveAtlas() as unknown as Record<string, AtlasEntry>;
+                    const hits = findCandidates(dep, now);
+                    if (hits.length > 0) {
+                        settled = true;
+                        clearTimeout(timer);
+                        // Best-effort unsubscribe via no-op; gossip.subscribe has no off() today.
+                        resolve(hits[0]);
+                    }
+                };
+
+                // gossip.subscribe(cb) does not return an unsubscribe handle;
+                // we leave the callback bound for the cell's lifetime, which
+                // is fine because it short-circuits after `settled`.
+                this.gossip.subscribe((_id, _record, event) => {
+                    if (event === 'joined' || event === 'updated') recheck();
+                });
+                // One initial pass after subscription, in case the candidate
+                // appeared during the brief window above.
+                recheck();
+            });
+
+            if (appeared) {
+                this.deps[alias] = {
+                    alias, ref: dep.ref, id: appeared.id, addr: appeared.entry.addr,
+                    version: appeared.entry.repoVersion,
+                    source: "spawned",
+                };
+                return;
+            }
+
+            this.unresolvedDeps[alias] = {
+                alias, ref: dep.ref, version: dep.version,
+                reason: "spawn-timeout",
+                detail: `no live cell matched ${dep.ref} within ${maxWaitMs}ms`,
+            };
+            if (!dep.optional) requiredFailures.push(alias);
+        };
+
+        await Promise.all(deps.map(resolveOne));
+
+        if (requiredFailures.length > 0) {
+            this.log(
+                "ERROR",
+                `Required dependencies unresolved: ${requiredFailures.join(", ")}. ` +
+                `Cell is online but cannot use these deps. See unresolvedDeps for detail.`,
+            );
+        }
+        const resolvedNames = Object.keys(this.deps);
+        if (resolvedNames.length > 0) {
+            this.log("INFO", `Dependencies resolved: ${resolvedNames.join(", ")}`);
+        }
+        this.depsReadyResolve();
     }
 
     /** Register a cleanup function to be called during cell shutdown. */
@@ -1831,6 +2041,33 @@ export class RheoCell {
         this.currentVersion = this.calculateVersion();
         this.cleanupGhostProcesses();
 
+        // --- DEPENDENCY READINESS PROMISE ---
+        // Created pending so `await cell.depsReady` blocks until
+        // resolveDependencies() settles. Cells with no deps settle instantly
+        // once listen() runs.
+        this.depsReady = new Promise<void>(resolve => {
+            this.depsReadyResolve = () => {
+                if (this.depsReadySettled) return;
+                this.depsReadySettled = true;
+                resolve();
+            };
+        });
+
+        // --- SOURCE MANIFEST (Cell.toml) ---
+        // Loaded once at construction so the gossip record advertises this
+        // cell's repo/version from the very first announce. Failure to find
+        // or parse Cell.toml leaves sourceManifest null — the cell still runs,
+        // it just isn't depend-on-able by other cells.
+        try {
+            this.sourceManifest = loadCellSourceManifest(this.cellDir);
+            if (this.sourceManifest?.dependencies?.length) {
+                validateAliases(this.sourceManifest);
+            }
+        } catch (e: any) {
+            this.sourceManifest = null;
+            console.warn(`[${this.id}] Cell.toml load/validation failed: ${e?.message ?? e}`);
+        }
+
         // --- GOSSIP MEMBERSHIP INIT ---
         this.gossip = new GossipRegistry(this.id);
         this.ring = new ConsistentHashRing();
@@ -1981,6 +2218,20 @@ export class RheoCell {
         }
     };
 
+    /**
+     * Optional source-attribution fields gossipped alongside every record.
+     * Empty object if this cell has no Cell.toml [meta] block — keeping the
+     * spread no-op preserves the existing record shape exactly.
+     */
+    private _sourceAttribution(): { repo?: string; repoVersion?: string } {
+        const meta = this.sourceManifest?.meta;
+        if (!meta) return {};
+        const out: { repo?: string; repoVersion?: string } = {};
+        if (meta.repo) out.repo = meta.repo;
+        if (meta.version) out.repoVersion = meta.version;
+        return out;
+    }
+
     private registerToRegistry() {
         if (!this.addr) return;
         const record = {
@@ -1993,6 +2244,7 @@ export class RheoCell {
             lastGossiped: Date.now(),
             gossipHopCount: 0,
             status: 'online' as const,
+            ...this._sourceAttribution(),
         };
         this.gossip.announce(record);
         this.ring.add(this.id);
@@ -2012,6 +2264,7 @@ export class RheoCell {
             lastGossiped: Date.now(),
             gossipHopCount: 0,
             status: 'offline' as const,
+            ...this._sourceAttribution(),
         };
         this.gossip.announceOffline(record);
         this.ring.remove(this.id);
@@ -3584,7 +3837,8 @@ export class RheoCell {
             firstSeen: Date.now(),
             status: 'online',
             lastSeen: Date.now(),
-            lastGossiped: Date.now(), gossipHopCount: 0
+            lastGossiped: Date.now(), gossipHopCount: 0,
+            ...this._sourceAttribution(),
         };
 
         // --- GOSSIP MEMBERSHIP BOOTSTRAP ---
@@ -3598,6 +3852,8 @@ export class RheoCell {
                     this.atlas[id].status = 'offline';
                     this.atlas[id].lastSeen = Date.now();
                 }
+                // Fire any onDependencyDeath hooks for resolved deps backed by this id.
+                this._handleGossipDead(id);
             } else if (record) {
                 this.mergeAtlas({ [id]: record as unknown as AtlasEntry }, false, 0);
                 // Keep the consistent hash ring in sync
@@ -3608,6 +3864,14 @@ export class RheoCell {
 
         // Start SWIM probes + anti-entropy sync
         this.gossip.start(this._gossipSend);
+
+        // Kick off dependency resolution. Fire-and-forget — cells that
+        // declared no [[dependencies]] get an instant resolve; cells with
+        // deps populate cell.deps in the background and signal completion
+        // via cell.depsReady.
+        this.resolveDependencies().catch(e =>
+            this.log("ERROR", `Dependency resolution crashed: ${e?.message ?? e}`)
+        );
 
         // --- IMMORTAL RESURRECTION PING ---
         // Gossip handles failure detection; this resurrects cells that were offline
@@ -3654,7 +3918,8 @@ export class RheoCell {
                 status: 'online',
                 lastSeen: Date.now(),
                 lastGossiped: Date.now(),
-                gossipHopCount: 0
+                gossipHopCount: 0,
+                ...this._sourceAttribution(),
             };
 
             const targets = Object.values(this.atlas)
