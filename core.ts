@@ -13,23 +13,95 @@ import {
     type KeyObject
 } from "node:crypto";
 import {
-    writeFileSync,
-    readFileSync,
-    existsSync,
-    mkdirSync,
-    statSync,
-    readdirSync,
-    unlinkSync
+    writeFileSync, readFileSync, existsSync, mkdirSync,
+    statSync, readdirSync, unlinkSync, createWriteStream
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { loadavg, homedir } from "node:os";
+import { createReadStream } from "node:fs";
+import { GossipRegistry, ConsistentHashRing, type GossipRecord } from "./gossip.ts";
 
 const currentDir = dirname(new URL(import.meta.url).pathname);
 const cellsRoot = resolve(currentDir, ".."); // ../ from app/
-// 1. GLOBAL REGISTRY: All cells on this computer will use this folder to find each other
-const REGISTRY_DIR = process.env.RHEO_REGISTRY_DIR || join(homedir(), ".rheo", "registry");
+// Bootstrap hint directory: stores only ~/.rheo/registry/peers.json (addresses, not state).
+// Gossip is the authoritative membership source; disk is a cold-start hint only.
+export const REGISTRY_DIR = process.env.RHEO_REGISTRY_DIR || join(homedir(), ".rheo", "registry");
 if (!existsSync(REGISTRY_DIR)) mkdirSync(REGISTRY_DIR, { recursive: true });
+
+// ============================================================================
+// CELL ADDRESS ABSTRACTION
+// Biological analogy: Like a cell's position in tissue — not just "localhost"
+// but a proper address in the extracellular matrix.
+// ============================================================================
+
+export interface CellAddress {
+    protocol: 'http' | 'https' | 'ws' | 'wss' | 'client' | 'unix';
+    host: string;
+    port: number;
+    path?: string;
+    toString(): string;
+}
+
+export function createCellAddress(
+    protocol: CellAddress['protocol'],
+    host: string,
+    port: number,
+    path?: string
+): CellAddress {
+    return {
+        protocol,
+        host,
+        port,
+        path,
+        toString() {
+            if (this.protocol === 'client') {
+                return `client://${this.host}`;
+            }
+            if (this.protocol === 'unix') {
+                return `unix://${this.host}:${this.port}`;
+            }
+            const base = `${this.protocol}://${this.host}:${this.port}`;
+            return this.path ? `${base}${this.path}` : base;
+        }
+    };
+}
+
+export function parseCellAddress(addr: string): CellAddress {
+    if (addr.startsWith('client://')) {
+        return createCellAddress('client', addr.replace('client://', ''), 0);
+    }
+    if (addr.startsWith('unix://')) {
+        const rest = addr.replace('unix://', '');
+        const [host, portStr] = rest.split(':');
+        return createCellAddress('unix', host, parseInt(portStr) || 0);
+    }
+    const match = addr.match(/^(https?):\/\/([^:]+):(\d+)(\/.*)?$/);
+    if (!match) {
+        const portMatch = addr.match(/^(\d+)$/);
+        if (portMatch) {
+            return createCellAddress('http', 'localhost', parseInt(portMatch[1]));
+        }
+        throw new Error(`Invalid cell address: ${addr}`);
+    }
+    return createCellAddress(
+        match[1] as CellAddress['protocol'],
+        match[2],
+        parseInt(match[3]),
+        match[4] || undefined
+    );
+}
+
+export function extractPortFromAddr(addr: string): number | null {
+    try {
+        const parsed = parseCellAddress(addr);
+        return parsed.port || null;
+    } catch {
+        const match = addr.match(/:(\d+)(?:\/|$)/);
+        return match ? parseInt(match[1]) : null;
+    }
+}
+
 
 // --- TYPES & INTERFACES ---
 
@@ -53,7 +125,7 @@ export interface AtlasEntry {
     lastSeen: number;        // When WE last heard from this cell directly
     lastGossiped: number;    // When we last forwarded this entry
     gossipHopCount: number;  // How many hops from source (for TTL)
-    status: 'online' | 'offline'; // <-- NEW: State tracking
+    status: 'online' | 'offline'; // State tracking
 }
 
 export interface TraceError {
@@ -303,6 +375,32 @@ export class MeshError extends Error {
             errorChain: this.errorChain
         };
     }
+}
+
+// === CELL SPAWN/KILL/ADOPT API ===
+// Any cell can manage other cells. No special orchestrator needed.
+
+interface SpawnOptions {
+    id: string;                    // Cell ID
+    command: string;               // e.g. "bun run index.ts"
+    cwd: string;                   // Working directory
+    env?: Record<string, string>;  // Extra env vars
+    critical?: boolean;            // Restart on crash?
+    restartDelayMs?: number;       // Delay before restart
+    maxRestarts?: number;          // Give up after N crashes
+}
+
+interface ManagedCell {
+    id: string;
+    pid: number;         // Only populated if WE spawned it. 0 if we just observe it.
+    port: number;
+    addr: string;
+    proc: any;           // ChildProcess — only if WE spawned it
+    status: 'starting' | 'online' | 'crashed' | 'stopped' | 'zombie';
+    startTime: number;
+    restarts: number;
+    lastCrash?: number;
+    stderrBuffer: string;
 }
 
 // --- Narrative ---
@@ -1004,8 +1102,182 @@ interface IntegrityCheck {
 // Global ledger instance per cell
 export const globalLedger = new NarrativeLedger();
 
+// RegistryWatcher replaced by GossipRegistry — membership changes now arrive
+// via SWIM probes and anti-entropy push/pull rather than fs.watch on JSON files.
+// Stub kept for any lingering call sites during the transition.
+class RegistryWatcher {
+    private static instance: RegistryWatcher | null = null;
+    static getInstance(): RegistryWatcher {
+        if (!RegistryWatcher.instance) RegistryWatcher.instance = new RegistryWatcher();
+        return RegistryWatcher.instance;
+    }
+    subscribe(_cb: (eventType: string, filename: string | null) => void): () => void {
+        return () => { };
+    }
+    destroy(): void {
+        RegistryWatcher.instance = null;
+    }
+}
 
-// --- end Narrative ---
+// ============================================================================
+// PORT REGISTRY & ACQUISITION (Prevents EADDRINUSE collisions)
+// ============================================================================
+
+interface PortOwner {
+    cellId: string;
+    pid: number;
+    port: number;
+    timestamp: number;
+    addr: string;
+}
+
+class PortRegistry {
+    private static PORT_FILE = join(homedir(), ".rheo", "port-registry.json");
+    private static LOCK_FILE = join(homedir(), ".rheo", ".port-lock");
+    private static lockFd: number | null = null;
+
+    static read(): Record<string, PortOwner> {
+        try {
+            if (!existsSync(this.PORT_FILE)) return {};
+            return JSON.parse(readFileSync(this.PORT_FILE, "utf8"));
+        } catch (e) { return {}; }
+    }
+
+    static write(owners: Record<string, PortOwner>) {
+        const dir = dirname(this.PORT_FILE);
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+        writeFileSync(this.PORT_FILE, JSON.stringify(owners, null, 2));
+    }
+
+    static async acquireLock(): Promise<boolean> {
+        // Simple file-based lock with retry
+        for (let i = 0; i < 50; i++) {
+            try {
+                const { openSync } = require("node:fs");
+                this.lockFd = openSync(this.LOCK_FILE, "wx");
+                return true;
+            } catch (e) {
+                await new Promise(r => setTimeout(r, 20));
+            }
+        }
+        return false;
+    }
+
+    static releaseLock() {
+        if (this.lockFd !== null) {
+            try {
+                const { closeSync, unlinkSync } = require("node:fs");
+                closeSync(this.lockFd);
+                unlinkSync(this.LOCK_FILE);
+            } catch (e) { }
+            this.lockFd = null;
+        }
+    }
+
+    static async claimPort(cellId: string, preferredPort: number, host: string = 'localhost'): Promise<{ port: number; adopted: boolean; existingAddr?: string }> {
+        await this.acquireLock();
+        try {
+            const owners = this.read();
+            const now = Date.now();
+
+            // Check if WE already own this port
+            if (owners[cellId]) {
+                const ours = owners[cellId];
+                try {
+                    const addr = createCellAddress('http', host, ours.port).toString();
+                    const health = await fetch(`${addr}/atlas`, {
+                        signal: AbortSignal.timeout(500)
+                    });
+                    if (health.ok) {
+                        return { port: ours.port, adopted: true, existingAddr: addr };
+                    }
+                } catch {
+                    delete owners[cellId];
+                }
+            }
+
+            // Check if preferred port is taken by someone else
+            const occupant = Object.values(owners).find(o => o.port === preferredPort);
+            if (occupant) {
+                let alive = false;
+                try {
+                    const addr = createCellAddress('http', host, preferredPort).toString();
+                    const ping = await fetch(`${addr}/atlas`, {
+                        signal: AbortSignal.timeout(300)
+                    });
+                    alive = ping.ok;
+                } catch {
+                    alive = false;
+                }
+
+                if (!alive) {
+                    delete owners[occupant.cellId];
+                } else {
+                    preferredPort = await this.findAvailablePort(preferredPort + 1, owners, host);
+                }
+            }
+
+            const testPort = await this.testPort(preferredPort);
+            if (!testPort) {
+                preferredPort = await this.findAvailablePort(preferredPort + 1, owners, host);
+            }
+
+            const newAddr = createCellAddress('http', host, preferredPort).toString();
+            owners[cellId] = {
+                cellId,
+                pid: process.pid,
+                port: preferredPort,
+                timestamp: now,
+                addr: newAddr
+            };
+
+            this.write(owners);
+            return { port: preferredPort, adopted: false };
+
+        } finally {
+            this.releaseLock();
+        }
+    }
+
+    private static async findAvailablePort(start: number, owners: Record<string, PortOwner>, host: string = 'localhost'): Promise<number> {
+        const usedPorts = new Set(Object.values(owners).map(o => o.port));
+        let port = start;
+        while (usedPorts.has(port) || !(await this.testPort(port))) {
+            port++;
+            if (port > 65535) throw new Error("No available ports");
+        }
+        return port;
+    }
+
+    private static async testPort(port: number): Promise<boolean> {
+        try {
+            const testServer = Bun.serve({
+                port,
+                fetch: () => new Response("test"),
+                development: false
+            });
+            testServer.stop();
+            return true;
+        } catch (e: any) {
+            if (e.code === 'EADDRINUSE') return false;
+            // Other errors might mean port is usable but something else failed
+            return false;
+        }
+    }
+
+    static releasePort(cellId: string) {
+        this.acquireLock();
+        try {
+            const owners = this.read();
+            if (owners[cellId]?.pid === process.pid) {
+                delete owners[cellId];
+                this.write(owners);
+            }
+        } finally {
+            this.releaseLock();
+        }
+    }
+}
 
 
 // --- CORE RHEO CELL ---
@@ -1029,6 +1301,9 @@ export class RheoCell {
 
     public mode: TransportMode = 'server';
 
+    // Gossip-based membership state machine (replaces ~/.rheo/registry/*.json)
+    public readonly gossip: GossipRegistry;
+    public readonly ring: ConsistentHashRing;
 
     private manifestPath: string;
     private cellDir: string;
@@ -1132,6 +1407,309 @@ export class RheoCell {
         });
     }
 
+    private managedCells = new Map<string, ManagedCell>();
+    private cellMonitors = new Map<string, Timer>(); // Health check intervals
+
+    /**
+     * Spawn a new cell as a child process.
+     * Returns immediately with the managed cell handle.
+     * The cell will self-register to the mesh when it comes online.
+     */
+    async spawn(options: SpawnOptions): Promise<ManagedCell> {
+        const { id, command, cwd, env = {}, critical = false, restartDelayMs = 1000, maxRestarts = 5 } = options;
+
+        // Check if already running anywhere on this machine via mesh discovery
+        // NEVER read another cell's manifest or inspect its process
+        const existing = await this.findCellById(id);
+        if (existing) {
+            this.log("INFO", `🤝 ${id} already running at ${existing.addr}, observing`);
+            return this.observeExisting(id, existing);
+        }
+
+        // Actually spawn
+        this.log("INFO", `🚀 Spawning ${id}: ${command}`);
+
+        // The child cell manages its OWN logs. We just pipe stdout/stderr to our console
+        // for observability while it's our child process. We do NOT create log files for it.
+        const proc = spawn(command, {
+            cwd,
+            stdio: ["ignore", "pipe", "pipe"],
+            shell: true,
+            env: {
+                ...process.env,
+                ...env,
+                RHEO_CELL_ID: id,
+                RHEO_SEED: this.addr,
+                RHEO_PARENT_ADDR: this.addr // Pass parent's mesh address, not PID
+            },
+            detached: false // If we die, the child dies with us (OS handles this)
+        });
+
+        const managed: ManagedCell = {
+            id,
+            pid: proc.pid!,
+            port: 0, // Unknown until cell registers
+            addr: "",
+            proc,
+            status: 'starting',
+            startTime: Date.now(),
+            restarts: 0,
+            stderrBuffer: ""
+        };
+
+        this.managedCells.set(id, managed);
+
+        // Pipe output to OUR console for observability while it's our child.
+        // The child manages its OWN log files — we don't create them.
+        proc.stdout?.on('data', (data: Buffer) => {
+            const lines = data.toString().split('\\n').filter(l => l.trim());
+            for (const line of lines) {
+                this.log("INFO", `[${id}] ${line}`);
+
+                const port = extractPortFromAddr(line);
+                if (port && managed.port === 0) {
+                    managed.port = port;
+                    const host = process.env.RHEO_HOST || 'localhost';
+                    managed.addr = createCellAddress('http', host, managed.port).toString();
+                    managed.status = 'online';
+                    this.log("INFO", `📡 ${id} online at ${managed.addr}`);
+
+                    this.mergeAtlas({
+                        [id]: {
+                            id, addr: managed.addr, caps: [],
+                            pubKey: "", firstSeen: Date.now(),
+                            lastSeen: Date.now(), lastGossiped: Date.now(),
+                            gossipHopCount: 0, status: 'online'
+                        }
+                    });
+                }
+            }
+        });
+
+        proc.stderr?.on('data', (data: Buffer) => {
+            const lines = data.toString().split('\\n').filter(l => l.trim());
+            for (const line of lines) {
+                this.log("WARN", `[${id}] ${line}`);
+            }
+            managed.stderrBuffer = (managed.stderrBuffer + data.toString()).slice(-10000);
+        });
+
+        proc.on('exit', (code, signal) => {
+            managed.status = code === 0 ? 'stopped' : 'crashed';
+
+            const emoji = signal === 'SIGKILL' ? '💥' : signal ? '🔪' : code === 0 ? '✅' : '❌';
+            this.log("INFO", `${emoji} ${id} exited (code ${code}, signal ${signal})`);
+
+            // Remove from managed
+            this.managedCells.delete(id);
+
+            // Auto-restart if critical
+            if (critical && managed.restarts < maxRestarts) {
+                managed.restarts++;
+                this.log("INFO", `🔄 Restarting ${id} in ${restartDelayMs}ms (attempt ${managed.restarts}/${maxRestarts})`);
+                setTimeout(() => {
+                    this.spawn(options).catch(e => this.log("ERROR", `Failed to restart ${id}: ${e.message}`));
+                }, restartDelayMs);
+            }
+        });
+
+        // Health monitor: poll atlas until cell appears
+        const monitor = setInterval(async () => {
+            if (managed.status === 'online') {
+                // Deep health check
+                try {
+                    const res = await fetch(`${managed.addr}/atlas`, {
+                        signal: AbortSignal.timeout(2000)
+                    });
+                    if (!res.ok) throw new Error("HTTP " + res.status);
+                    managed.status = 'online';
+                } catch {
+                    this.log("WARN", `⚠️ ${id} failed health check. Marking as unresponsive.`);
+                    managed.status = 'zombie';
+                    // TRUE SOVEREIGNTY: We do NOT kill the process. 
+                    // We just mark it unresponsive. The OS or the cell itself handles its fate.
+                }
+            }
+        }, 10000);
+        this.cellMonitors.set(id, monitor);
+
+        return managed;
+    }
+
+    /**
+     * Kill a managed cell by ID.
+     */
+    public async kill(cellId: string): Promise<boolean> {
+        // SOVEREIGNTY: We NEVER perform OS-level process kills.
+        // We politely ASK the cell to shut itself down via the mesh protocol.
+        // The target cell DECIDES whether to comply — it's sovereign.
+
+        const entry = this.atlas[cellId];
+        if (entry) {
+            try {
+                this.log("INFO", `🛑 Requesting graceful shutdown for ${cellId} via mesh...`);
+                await this.askMesh("cell/shutdown" as any, {}, {}, { maxWaitMs: 5000 });
+                return true;
+            } catch {
+                this.log("WARN", `⚠️ Could not reach ${cellId} to request shutdown.`);
+                return false;
+            }
+        }
+
+        this.log("WARN", `⚠️ Cannot request shutdown for ${cellId}: not found in atlas.`);
+        return false;
+    }
+
+    /**
+     * Observe an existing cell. We do NOT adopt its process — it remains sovereign.
+     * We just add it to our atlas and optionally subscribe to updates.
+     */
+    private observeExisting(id: string, existing: { addr: string }): ManagedCell {
+        // We create a lightweight handle for observability, NOT ownership
+        const managed: ManagedCell = {
+            id,
+            pid: 0, // We do NOT know or care about the PID
+            port: parseInt(existing.addr.split(':').pop() || '0'),
+            addr: existing.addr,
+            proc: null as any,
+            status: 'online',
+            startTime: Date.now(),
+            restarts: 0,
+            stderrBuffer: ""
+        };
+        this.managedCells.set(id, managed);
+
+        // Pull their atlas and announce ourselves to them (mesh protocol)
+        fetch(`${existing.addr}/atlas`)
+            .then(r => r.json())
+            .then(data => {
+                if (data.atlas) this.mergeAtlas(data.atlas, false, 0);
+            })
+            .catch(() => { });
+
+        // Announce ourselves so they know we're here
+        const myEntry = {
+            id: this.id,
+            addr: this._addr,
+            caps: Object.keys(this.handlers),
+            pubKey: this.publicKey,
+            firstSeen: Date.now(),
+            status: 'online' as const,
+            lastSeen: Date.now(),
+            lastGossiped: Date.now(),
+            gossipHopCount: 0
+        };
+        fetch(`${existing.addr}/announce`, {
+            method: "POST",
+            body: JSON.stringify(myEntry),
+            headers: { "Content-Type": "application/json" }
+        }).catch(() => { });
+
+        // NO log tailing — that's the cell's private business.
+        // If we spawned it, we already get stdout/stderr via the proc pipes.
+        // If we didn't spawn it, we have no right to its logs.
+
+        return managed;
+    }
+
+    /**
+     * Find a cell by ID using gossip state, then atlas, then a live HTTP probe.
+     * NEVER reads another cell's manifest. NEVER inspects PIDs.
+     */
+    private async findCellById(id: string): Promise<{ addr: string } | null> {
+        // 1. Gossip is authoritative
+        const gossipEntry = this.gossip.liveAtlas()[id];
+        if (gossipEntry?.addr) {
+            try {
+                const res = await fetch(`${gossipEntry.addr}/gossip/ping`, {
+                    signal: AbortSignal.timeout(500)
+                });
+                if (res.ok) return { addr: gossipEntry.addr };
+            } catch { }
+        }
+        // 2. Fallback to atlas (covers cells not yet in gossip state)
+        const atlasEntry = this.atlas[id];
+        if (atlasEntry?.addr) {
+            try {
+                const res = await fetch(`${atlasEntry.addr}/gossip/ping`, {
+                    signal: AbortSignal.timeout(500)
+                });
+                if (res.ok) return { addr: atlasEntry.addr };
+            } catch { }
+        }
+        return null;
+    }
+
+    /**
+     * Get all cells managed by this cell.
+     */
+    getManagedCells(): Array<{ id: string; addr: string; status: string; spawned: boolean }> {
+        return Array.from(this.managedCells.values()).map(m => ({
+            id: m.id,
+            addr: m.addr,
+            status: m.status,
+            spawned: m.proc !== null // true if we created the process
+        }));
+    }
+
+    /**
+     * Get census of ALL cells on this machine (managed or not).
+     */
+    async localCensus(): Promise<Array<{ id: string, alive: boolean, addr?: string, managed: boolean }>> {
+        const results: Array<{ id: string, alive: boolean, addr?: string, managed: boolean }> = [];
+        const seen = new Set<string>();
+
+        // Managed cells (ones we spawned — we know about them via proc, not via filesystem)
+        for (const [id, m] of this.managedCells) {
+            seen.add(id);
+            results.push({ id, alive: m.status === 'online', addr: m.addr, managed: true });
+        }
+
+        // Gossip-known cells (authoritative membership view)
+        for (const [id, r] of Object.entries(this.gossip.liveAtlas())) {
+            if (seen.has(id)) continue;
+            seen.add(id);
+            results.push({ id, alive: r.memberStatus === 'alive', addr: r.addr, managed: false });
+        }
+
+        return results;
+    }
+
+    private async checkForExistingInstance(): Promise<{ addr: string, port: number } | null> {
+        const manifestDir = join(process.cwd(), ".rheo", "manifests");
+        const manifestPath = join(manifestDir, `${this.id}.cell.json`);
+
+        if (!existsSync(manifestPath)) return null;
+
+        try {
+            const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+            if (!manifest.port) return null;
+
+            if (manifest.pid === process.pid) {
+                // We're the ones running now
+            }
+
+            try {
+                const host = process.env.RHEO_HOST || 'localhost';
+                const addr = createCellAddress('http', host, manifest.port).toString();
+                const res = await fetch(`${addr}/atlas`, {
+                    signal: AbortSignal.timeout(500)
+                });
+                if (res.ok) {
+                    if (manifest.pid && manifest.pid !== process.pid) {
+                        return { addr, port: manifest.port };
+                    }
+                    return { addr, port: manifest.port };
+                }
+            } catch {
+                try { unlinkSync(manifestPath); } catch { }
+                return null;
+            }
+        } catch { }
+
+        return null;
+    }
+
     constructor(public id: string, public port: number = 0, public seed?: string) {
         if (process.env.RHEO_CELL_ID) {
             this.id = process.env.RHEO_CELL_ID;
@@ -1202,6 +1780,10 @@ export class RheoCell {
         this.currentVersion = this.calculateVersion();
         this.cleanupGhostProcesses();
 
+        // --- GOSSIP MEMBERSHIP INIT ---
+        this.gossip = new GossipRegistry(this.id);
+        this.ring = new ConsistentHashRing();
+
         // --- SOVEREIGN DEFAULTS ---
         this.provide("mesh/ping", () => "PONG");
         this.provide("mesh/gossip", (args: { atlas: Record<string, AtlasEntry> }, ctx: any) => {
@@ -1247,8 +1829,27 @@ export class RheoCell {
         }));
 
         this.provide("cell/contract", (args: { cap: string }) => this.contracts.get(args.cap) || null);
-    }
 
+        this.provide("cell/spawn", async (args: SpawnOptions) => {
+            const managed = await this.spawn(args);
+            return { id: managed.id, pid: managed.pid, addr: managed.addr, status: managed.status };
+        });
+
+        this.provide("cell/kill", async (args: { id: string }) => {
+            const ok = await this.kill(args.id);
+            return { ok };
+        });
+
+        this.provide("cell/list-managed", () => {
+            return this.getManagedCells().map(m => ({
+                id: m.id, addr: m.addr, status: m.status, spawned: m.spawned
+            }));
+        });
+
+        this.provide("cell/census", async () => {
+            return this.localCensus();
+        });
+    }
 
     /**
      * Call ALL cells providing a capability, not just one
@@ -1308,11 +1909,30 @@ export class RheoCell {
         };
     }
 
-    // --- DECENTRALIZED DISCOVERY ---
+    // --- GOSSIP-BASED DISCOVERY ---
+
+    // Gossip transport: thin fetch wrapper used by GossipRegistry probe/sync loops.
+    private readonly _gossipSend = async (addr: string, path: string, body: unknown) => {
+        try {
+            const res = await fetch(`${addr}${path}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(GossipRegistry.PROBE_TIMEOUT_MS + 200)
+            });
+            if (res.ok) {
+                const data = await res.json().catch(() => null);
+                return { ok: true, data };
+            }
+            return { ok: false };
+        } catch {
+            return null;
+        }
+    };
 
     private registerToRegistry() {
         if (!this.addr) return;
-        const entry: AtlasEntry = {
+        const record = {
             id: this.id,
             addr: this.addr,
             caps: Object.keys(this.handlers),
@@ -1321,61 +1941,77 @@ export class RheoCell {
             lastSeen: Date.now(),
             lastGossiped: Date.now(),
             gossipHopCount: 0,
-            status: 'online'
+            status: 'online' as const,
         };
-        try {
-            writeFileSync(join(REGISTRY_DIR, `${this.id}.json`), JSON.stringify(entry));
-        } catch (e) { }
+        this.gossip.announce(record);
+        this.ring.add(this.id);
+        // Write bootstrap hint so fresh restarts can find at least one peer address
+        this._saveBootstrapHint();
     }
 
     private markOfflineInRegistry() {
-        try {
-            if (!this.addr) return;
-            const entry: AtlasEntry = {
-                id: this.id,
-                addr: this.addr,
-                caps: Object.keys(this.handlers),
-                pubKey: this.publicKey,
-                firstSeen: this.atlas[this.id]?.firstSeen || Date.now(),
-                lastSeen: Date.now(),
-                lastGossiped: Date.now(),
-                gossipHopCount: 0,
-                status: 'offline'
-            };
-            writeFileSync(join(REGISTRY_DIR, `${this.id}.json`), JSON.stringify(entry));
-        } catch (e) { }
+        if (!this.addr) return;
+        const record = {
+            id: this.id,
+            addr: this.addr,
+            caps: Object.keys(this.handlers),
+            pubKey: this.publicKey,
+            firstSeen: this.atlas[this.id]?.firstSeen || Date.now(),
+            lastSeen: Date.now(),
+            lastGossiped: Date.now(),
+            gossipHopCount: 0,
+            status: 'offline' as const,
+        };
+        this.gossip.announceOffline(record);
+        this.ring.remove(this.id);
     }
 
-    public async bootstrapFromRegistry(forceAll = false) {
-        try {
-            const files = readdirSync(REGISTRY_DIR).filter(f => f.endsWith('.json') && f !== `${this.id}.json`);
-            const peers = forceAll ? files : files.sort(() => 0.5 - Math.random()).slice(0, 5);
-
-            for (const file of peers) {
-                try {
-                    const content = readFileSync(join(REGISTRY_DIR, file), 'utf8');
-                    const entry: AtlasEntry = JSON.parse(content);
-
-                    // ADD THIS: Verify cell is actually alive before merging
-                    if (Date.now() - entry.lastSeen < 60000) {
-                        try {
-                            // Quick ping to verify liveness
-                            const pingRes = await fetch(`${entry.addr}/atlas`, {
-                                method: "POST",
-                                signal: AbortSignal.timeout(500)
-                            });
-                            if (!pingRes.ok) throw new Error("Dead");
-                        } catch (e) {
-                            // Cell is dead, remove from registry
-                            unlinkSync(join(REGISTRY_DIR, file));
-                            continue; // Skip this entry
-                        }
-                    }
-
-                    this.mergeAtlas({ [entry.id || file.replace('.json', '')]: entry }, false, 0);
-                } catch (e) { }
+    // Bootstrap: pull gossip state from any reachable peer.
+    // Priority: RHEO_BOOTSTRAP_PEERS env > ~/.rheo/registry/peers.json > seed arg.
+    // The old per-cell *.json files are no longer written or read.
+    public async bootstrapFromRegistry(_forceAll = false) {
+        const addrs = this._collectBootstrapAddrs();
+        if (addrs.length > 0) {
+            await this.gossip.join(addrs);
+        }
+        // Merge whatever gossip already knows into our atlas
+        const live = this.gossip.liveAtlas();
+        for (const [id, r] of Object.entries(live)) {
+            if (id !== this.id) {
+                this.mergeAtlas({ [id]: r as unknown as AtlasEntry }, false, 0);
             }
-        } catch (e) { }
+        }
+    }
+
+    private _collectBootstrapAddrs(): string[] {
+        const addrs: string[] = [];
+        // 1. Explicit env override (works across machines; no seed file needed)
+        const envPeers = process.env.RHEO_BOOTSTRAP_PEERS;
+        if (envPeers) {
+            addrs.push(...envPeers.split(',').map(s => s.trim()).filter(Boolean));
+        }
+        // 2. Bootstrap hint file written by previous sessions
+        const hintFile = join(REGISTRY_DIR, 'peers.json');
+        try {
+            if (existsSync(hintFile)) {
+                const { addrs: saved } = JSON.parse(readFileSync(hintFile, 'utf8')) as { addrs: string[] };
+                if (Array.isArray(saved)) addrs.push(...saved);
+            }
+        } catch { }
+        // 3. Seed passed to constructor / connect()
+        if (this.seed) addrs.push(this.seed);
+        return [...new Set(addrs)];
+    }
+
+    // Write the bootstrap hint (just addresses, not full state).
+    private _saveBootstrapHint() {
+        try {
+            const live = Object.values(this.gossip.liveAtlas())
+                .filter(r => r.id !== this.id && !r.addr.startsWith('client://'))
+                .map(r => r.addr);
+            if (live.length === 0) return;
+            writeFileSync(join(REGISTRY_DIR, 'peers.json'), JSON.stringify({ addrs: live, updated: Date.now() }));
+        } catch { }
     }
 
     // --- NARRATIVE METHODS ---
@@ -1481,34 +2117,101 @@ export class RheoCell {
     }
 
     private cleanupGhostProcesses() {
-        if (process.env.RHEO_GHOST_CLEANUP === "true") {
-            if (!existsSync(this.manifestPath)) return;
-            try {
-                const m = JSON.parse(readFileSync(this.manifestPath, 'utf8'));
-                if (m.pid && m.pid !== process.pid) process.kill(m.pid, 'SIGKILL');
-            } catch (e) { }
-        };
+        if (!existsSync(this.manifestPath)) return;
+        try {
+            const m = JSON.parse(readFileSync(this.manifestPath, 'utf8'));
+            if (m.pid && m.pid !== process.pid) {
+                try {
+                    if (m.port) {
+                        const host = process.env.RHEO_HOST || 'localhost';
+                        const addr = createCellAddress('http', host, m.port).toString();
+                        fetch(`${addr}/atlas`, {
+                            signal: AbortSignal.timeout(300)
+                        }).then(res => {
+                            if (!res.ok) {
+                                try { unlinkSync(this.manifestPath); } catch { }
+                            }
+                        }).catch(() => {
+                            try { unlinkSync(this.manifestPath); } catch { }
+                        });
+                    }
+                } catch {
+                    try { unlinkSync(this.manifestPath); } catch { }
+                }
+            }
+        } catch { }
     }
 
     private saveManifest() {
         if (this.isShuttingDown) return;
         const manifest: CellManifest = {
-            pid: process.pid, version: this.currentVersion, port: this.server?.port || this.port,
-            startTime: Date.now(), capabilities: Object.keys(this.handlers), seed: this.seed, pubKey: this.publicKey
+            pid: process.pid,
+            version: this.currentVersion,
+            port: this.server?.port || this.port,
+            startTime: Date.now(),
+            capabilities: Object.keys(this.handlers),
+            seed: this.seed,
+            pubKey: this.publicKey
         };
-        if (!existsSync(dirname(this.manifestPath))) mkdirSync(dirname(this.manifestPath), { recursive: true });
-        writeFileSync(this.manifestPath, JSON.stringify(manifest, null, 2));
+        const manifestDir = join(process.cwd(), ".rheo", "manifests");
+        if (!existsSync(manifestDir)) mkdirSync(manifestDir, { recursive: true });
+        writeFileSync(join(manifestDir, `${this.id}.cell.json`), JSON.stringify(manifest, null, 2));
     }
 
-    public handleShutdown(): TraceResult {
-        if (this.isShuttingDown) return { ok: true, cid: randomUUID() };
+    private shutdownPhase: 'running' | 'draining' | 'closing' | 'dead' = 'running';
+
+    public async handleShutdown(): Promise<TraceResult> {
+        if (this.shutdownPhase !== 'running') {
+            return { ok: true, value: { status: this.shutdownPhase }, cid: randomUUID() };
+        }
+
+        this.shutdownPhase = 'draining';
         this.isShuttingDown = true;
+
+        PortRegistry.releasePort(this.id);
         this.markOfflineInRegistry();
         this.activeIntervals.forEach(clearInterval);
         this.log("WARN", "Extinguishing cell...");
-        if (this.server) this.server.stop();
-        setTimeout(() => process.exit(0), 200);
-        return { ok: true, value: { status: "extinguishing" }, cid: randomUUID() };
+
+        // === PHASE 1: ABORT ALL OUTBOUND FETCHES ===
+        // We own these controllers. We abort them. They throw immediately.
+        const controllerCount = this.activeControllers.size;
+        if (controllerCount > 0) {
+            this.log("INFO", `🔪 Aborting ${controllerCount} outbound requests...`);
+            for (const [id, ctrl] of this.activeControllers) {
+                ctrl.abort();
+            }
+        }
+
+        // === PHASE 2: WAIT FOR IN-FLIGHT HANDLERS ===
+        // These are promises WE created in route(). We await them.
+        // They will finish naturally (no new signals accepted) or hit our abort.
+        const pending = Array.from(this.activeExecutions.values());
+        if (pending.length > 0) {
+            this.log("INFO", `⏳ Draining ${pending.length} active executions...`);
+            await Promise.race([
+                Promise.allSettled(pending),
+                new Promise(resolve => setTimeout(resolve, 600000)) // 10m hard ceiling
+            ]);
+        }
+
+        // === PHASE 3: CLOSE SERVER ===
+        // Stop accepting new connections. Bun/Node close() waits for in-flight HTTP responses.
+        this.shutdownPhase = 'closing';
+        if (this.server) {
+            this.server.stop(); // Immediate, no await
+            // Give in-flight handlers a moment to notice shutdownPhase
+            await new Promise(r => setTimeout(r, 500));
+        }
+
+        // === PHASE 4: CLEANUP ===
+        this.gossip.stop();
+        RegistryWatcher.getInstance().destroy();  // no-op stub; kept for safety
+
+        this.shutdownPhase = 'dead';
+        this.log("INFO", "💀 Cell extinguished.");
+
+        return { ok: true, value: { status: "extinguished" }, cid: randomUUID() };
     }
 
     public provide(capability: string, handler: Function) {
@@ -1687,6 +2390,20 @@ export class RheoCell {
      * Responsibility: Deduplication, Loop Prevention, Narrative Tracking, and Execution.
      */
     private async route(signal: Signal): Promise<TraceResult> {
+        // REJECT new signals once draining starts
+        if (this.shutdownPhase !== 'running') {
+            return {
+                ok: false,
+                cid: signal.id,
+                error: {
+                    code: "SHUTTING_DOWN",
+                    msg: `Cell is ${this.shutdownPhase} and not accepting new signals`,
+                    from: this.id,
+                    trace: signal.trace || []
+                }
+            };
+        }
+
         while (this.activeExecutions.size >= this.maxConcurrent) {
             await new Promise(r => setTimeout(r, 10));
         }
@@ -1902,7 +2619,8 @@ export class RheoCell {
 
     /** 5. Logic to prevent infinite flood storms */
     private shouldAttemptFlood(signal: Signal, providers: AtlasEntry[]): boolean {
-        return !signal._floodAttempted;
+        return false; // <-- DISABLE FLOODING TEMPORARILY
+        // return !signal._floodAttempted;
     }
 
     /** 6. Orchestrates parallel flooding to non-provider neighbors */
@@ -1982,6 +2700,12 @@ export class RheoCell {
 
     private failedAddresses = new Map<string, { count: number, lastFail: number }>();
 
+    // === EXPLICIT RPC LIFECYCLE MANAGEMENT ===
+    // Every outbound fetch gets an AbortController that WE own.
+    // Shutdown calls abort() on all of them. No praying.
+
+    private activeControllers = new Map<string, AbortController>();
+
     public async rpc(addr: string, signal: Signal): Promise<TraceResult> {
         const failure = this.failedAddresses.get(addr);
         if (failure && failure.count > 3 && Date.now() - failure.lastFail < 30000) {
@@ -2009,12 +2733,25 @@ export class RheoCell {
             payloadSize: JSON.stringify(signal.payload).length
         });
 
+        // Create OUR controller for this fetch. If shutdown fires, we abort this.
+        const controller = new AbortController();
+        const rpcId = `${cid}:${addr}:${Date.now()}`;
+        this.activeControllers.set(rpcId, controller);
+
+        // If already shutting down, abort immediately — don't even start
+        if (this.isShuttingDown) {
+            controller.abort();
+        }
+
         try {
             const res = await fetch(addr, {
                 method: "POST",
                 body: JSON.stringify(signal),
                 headers: { "Content-Type": "application/json" },
-                signal: AbortSignal.timeout(600000)
+                signal: AbortSignal.any([
+                    controller.signal,
+                    AbortSignal.timeout(600000)
+                ])
             });
 
             const duration = performance.now() - startTime;
@@ -2053,7 +2790,6 @@ export class RheoCell {
 
             const r = data.result || data;
 
-            // FIXED: Properly merge remote narrative
             if (!r.ok && r.error?._envelope) {
                 try {
                     this.ledger.merge(r.error._envelope);
@@ -2066,7 +2802,6 @@ export class RheoCell {
                 this.log("INFO", "✅ RPC_SUCCESS: [" + signal.payload.capability + "] from " + addr, cid);
             } else if (!r.ok) {
                 const err = r.error as TraceError;
-                // CONCISE ERROR LOGGING: Don't dump the whole narrative, just the essentials
                 this.log('ERROR',
                     `❌ RPC_REMOTE_FAIL: [${signal.payload.capability}] @ ${addr} | ${err?.code}: ${err?.msg?.substring(0, 100)}`,
                     cid
@@ -2074,9 +2809,23 @@ export class RheoCell {
             }
 
             return r;
-        } catch (e: any) {
-            const duration = performance.now() - startTime;
 
+        } catch (e: any) {
+            // Distinguish OUR abort from other errors
+            if (controller.signal.aborted && this.isShuttingDown) {
+                return {
+                    ok: false,
+                    cid,
+                    error: {
+                        code: "SHUTDOWN_ABORT",
+                        msg: "Request aborted due to cell shutdown",
+                        from: this.id,
+                        trace: signal.trace || []
+                    }
+                };
+            }
+
+            const duration = performance.now() - startTime;
             let errorCode = "RPC_FAIL";
             let errorDetails: any = {
                 targetAddress: addr,
@@ -2125,13 +2874,8 @@ export class RheoCell {
                 _envelope: envelope
             };
 
-            // LOGGING LOGIC
             const isOrigin = signal.from === this.id;
             const hasPrinted = (signal as any)._errorPrinted;
-
-            // 🔇 SILENCE GOSSIP FAILURES:
-            // If we can't reach a node during gossip, we pruned it above. 
-            // We don't need to log an error for it.
             const isGossipUnreachable = errorCode === "RPC_UNREACHABLE" && signal.payload.capability === 'mesh/gossip';
 
             if ((isOrigin || !hasPrinted) && !isGossipUnreachable) {
@@ -2145,6 +2889,10 @@ export class RheoCell {
             }
 
             return { ok: false, cid, error: richError };
+
+        } finally {
+            // ALWAYS clean up, no matter what
+            this.activeControllers.delete(rpcId);
         }
     }
 
@@ -2461,8 +3209,9 @@ export class RheoCell {
     }
 
     private async handleRequest(req: Request): Promise<Response> {
-
-        if (this.isShuttingDown) return new Response("Stopping", { status: 503 });
+        if (this.shutdownPhase !== 'running') {
+            return new Response(`Cell is ${this.shutdownPhase}`, { status: 503 });
+        }
 
         // 1. HANDSHAKE
         if (req.url.endsWith('/announce')) {
@@ -2475,7 +3224,41 @@ export class RheoCell {
             }
         }
 
-        // 2. REFLECTION
+        // 2. GOSSIP PROTOCOL ENDPOINTS
+        // /gossip/ping  — SWIM liveness probe (direct)
+        // /gossip/pull  — anti-entropy: return our full gossip state
+        // /gossip/push  — receive pushed gossip state (push-pull: returns ours)
+        // /gossip/probe — indirect probe: we probe `target` on the caller's behalf
+        if (req.url.includes('/gossip/')) {
+            try {
+                if (req.url.endsWith('/gossip/ping')) {
+                    return Response.json(this.gossip.handlePing());
+                }
+                if (req.url.endsWith('/gossip/pull')) {
+                    return Response.json({ state: this.gossip.handlePull() });
+                }
+                if (req.url.endsWith('/gossip/push') && req.method === 'POST') {
+                    const { state } = await req.json() as { state: any[] };
+                    const reply = this.gossip.receivePush(state);
+                    // Merge incoming state into our atlas as well
+                    for (const r of state) {
+                        if (r?.id && r.memberStatus !== 'dead') {
+                            this.mergeAtlas({ [r.id]: r as AtlasEntry }, false, 0);
+                        }
+                    }
+                    return Response.json({ state: reply });
+                }
+                if (req.url.endsWith('/gossip/probe') && req.method === 'POST') {
+                    const { target } = await req.json() as { target: string };
+                    const ok = await this.gossip.probeFor(target);
+                    return Response.json({ ok });
+                }
+            } catch {
+                return new Response("Bad Request", { status: 400 });
+            }
+        }
+
+        // 3. REFLECTION
         if (req.url.endsWith('/atlas')) {
             return Response.json({ atlas: this.atlas });
         }
@@ -2526,30 +3309,22 @@ export class RheoCell {
             this.seed = seedAddr;
         }
 
-        // Bootstrap from registry to find peers
+        // Bootstrap via gossip pull (any reachable peer will do)
         await this.bootstrapFromRegistry(true);
 
-        // If we have a seed, try to connect directly
-        if (this.seed && Object.keys(this.atlas).length === 0) {
-            try {
-                const response = await fetch(`${this.seed}/atlas`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ requester: this.id })
-                });
-                if (response.ok) {
-                    const { atlas } = await response.json();
-                    this.mergeAtlas(atlas, false, 0);
-                }
-            } catch (e) {
-                this.log("WARN", "Could not connect to seed, will retry via gossip");
+        // Wire gossip events into atlas (client cells don't run a server-side SWIM loop)
+        this.gossip.subscribe((id, record, event) => {
+            if (event === 'dead') {
+                if (this.atlas[id]) this.atlas[id].status = 'offline';
+            } else if (record) {
+                this.mergeAtlas({ [id]: record as unknown as AtlasEntry }, false, 0);
             }
-        }
+        });
 
-        // Register ourselves (even as client) so others know we exist
+        // Register our client presence into the gossip ring
         this.registerToRegistry();
 
-        // Start heartbeat
+        // Heartbeat: keep our gossip entry fresh
         const heartbeat = setInterval(() => this.registerToRegistry(), 5000);
         this.activeIntervals.push(heartbeat);
 
@@ -2562,7 +3337,47 @@ export class RheoCell {
  * Responsibility: Serves the HTTP substrate, handles P2P handshake, 
  * and performs defensive entry-point checks before routing.
  */
-    public listen() {
+    public async listen() {
+        // === GHOST BUSTER (Dead-Man's Switch) ===
+        // Voluntary Dead-Man's Switch: If spawned by a parent, we MAY choose to
+        // shut down if the parent disappears. But it's OUR choice — sovereignty.
+        const parentAddr = process.env.RHEO_PARENT_ADDR;
+        if (parentAddr) {
+            const watchdog = setInterval(async () => {
+                try {
+                    // Check parent via mesh protocol (HTTP), not process inspection
+                    const res = await fetch(`${parentAddr}/atlas`, {
+                        signal: AbortSignal.timeout(1000)
+                    });
+                    if (!res.ok) throw new Error("Parent not responding");
+                } catch (e) {
+                    // Parent is gone. We can choose to:
+                    // 1. Continue as orphan (sovereign default)
+                    // 2. Shut down (if we depend on parent)
+                    const orphanMode = process.env.RHEO_ORPHAN_MODE !== 'false';
+                    if (orphanMode) {
+                        this.log("INFO", `Parent at ${parentAddr} vanished. Continuing as orphan (sovereign mode).`);
+                        clearInterval(watchdog);
+                        // We keep running. We're sovereign.
+                    } else {
+                        this.log("WARN", `Parent at ${parentAddr} vanished. Shutting down (dependent mode).`);
+                        clearInterval(watchdog);
+                        await this.handleShutdown();
+                    }
+                }
+            }, 5000); // Check every 5s (less aggressive)
+            this.activeIntervals.push(watchdog);
+        }
+
+        // === SOVEREIGN SINGLETON CHECK ===
+        const existing = await this.checkForExistingInstance();
+        if (existing) {
+            console.log(`🤝 ${this.id} already alive at ${existing.addr} (PID ${existing.pid}). Yielding to existing instance.`);
+            // DO NOT connect as a client zombie. Just return.
+            // By returning immediately, the event loop remains empty and the engine evaporates instantly.
+            return;
+        }
+
         let actualPort = this.port;
 
         if (!bunServe) {
@@ -2575,7 +3390,8 @@ export class RheoCell {
                 req.on('data', chunk => chunks.push(chunk));
                 req.on('end', async () => {
                     const body = Buffer.concat(chunks);
-                    const url = `http://localhost:${this.port}${req.url}`;
+                    const host = process.env.RHEO_HOST || 'localhost';
+                    const url = `${createCellAddress('http', host, this.port).toString()}${req.url}`;
 
                     const request = new Request(url, {
                         method: req.method,
@@ -2605,7 +3421,8 @@ export class RheoCell {
                 const address = nodeServer.address();
                 if (address && typeof address === 'object') {
                     this.port = address.port;
-                    this._addr = `http://localhost:${address.port}`;
+                    const host = process.env.RHEO_HOST || 'localhost';
+                    this._addr = createCellAddress('http', host, address.port).toString();
 
                     // Store server for shutdown
                     (this as any).server = {
@@ -2620,18 +3437,42 @@ export class RheoCell {
             return;
         }
 
+        // Use port registry for robust acquisition
+        let portResult: { port: number; adopted: boolean; existingAddr?: string };
+        try {
+            const host = process.env.RHEO_HOST || 'localhost';
+            portResult = await PortRegistry.claimPort(this.id, this.port || 0, host);
+        } catch (e: any) {
+            this.log("ERROR", `Failed to acquire port: ${e.message}`);
+            portResult = { port: 0, adopted: false };
+        }
+
+        if (portResult.adopted && portResult.existingAddr) {
+            // Don't start server - connect to existing instance
+            this.port = portResult.port;
+            this._addr = portResult.existingAddr;
+            this.log("INFO", `🤝 Adopted existing cell at ${this._addr}`);
+            this.completeListenSetup();
+            return;
+        }
+
+        this.port = portResult.port;
+
         try {
             this.server = bunServe({
                 port: this.port,
                 fetch: this.handleRequest.bind(this)
             });
-
             actualPort = this.server.port;
         } catch (e: any) {
             if (e.code === 'EADDRINUSE') {
-                this.log("WARN", `Port ${this.port} in use, seeking alternative...`);
+                // Port registry was wrong, force new search
+                this.log("WARN", `Port ${this.port} in use despite registry check, finding alternative...`);
+                const host = process.env.RHEO_HOST || 'localhost';
+                portResult = await PortRegistry.claimPort(this.id, this.port + 1000, host);
+                this.port = portResult.port;
                 this.server = bunServe({
-                    port: 0,
+                    port: this.port,
                     fetch: this.handleRequest.bind(this)
                 });
                 actualPort = this.server.port;
@@ -2640,9 +3481,26 @@ export class RheoCell {
 
         // --- POST-BOOT INITIALIZATION ---
         this.port = actualPort;
-        this._addr = `http://localhost:${actualPort}`;
+        const host = process.env.RHEO_HOST || 'localhost';
+        this._addr = createCellAddress('http', host, actualPort).toString();
 
         this.completeListenSetup();
+    }
+
+
+    private async connectAsClient() {
+        this.mode = 'client';
+
+        // Bootstrap via gossip pull from any reachable peer
+        await this.bootstrapFromRegistry(true);
+
+        // Register our presence into gossip
+        this.registerToRegistry();
+
+        const heartbeat = setInterval(() => this.registerToRegistry(), 5000);
+        this.activeIntervals.push(heartbeat);
+
+        this.log("INFO", `Connected as client @ ${this._addr}`);
     }
 
     /**
@@ -2659,51 +3517,59 @@ export class RheoCell {
             lastGossiped: Date.now(), gossipHopCount: 0
         };
 
-        // --- DECENTRALIZED REGISTRY BOOTSTRAP ---
+        // --- GOSSIP MEMBERSHIP BOOTSTRAP ---
         this.registerToRegistry();
         this.bootstrapFromRegistry().catch(() => { });
 
-        // --- 1. OS-LEVEL FILESYSTEM PUBSUB ---
-        try {
-            import("node:fs").then(fs => {
-                this.fsWatcher = fs.watch(REGISTRY_DIR, (eventType, filename) => {
-                    if (filename && filename.endsWith('.json')) {
-                        try {
-                            const content = fs.readFileSync(join(REGISTRY_DIR, filename), 'utf8');
-                            const entry = JSON.parse(content);
-                            entry.status = 'online';
-                            entry.lastSeen = Date.now();
-                            entry.firstSeen = entry.firstSeen || Date.now();
-                            this.mergeAtlas({ [entry.id]: entry }, false, 0);
-                        } catch (e) { } // File might be half-written or deleted, safe to ignore
-                    }
-                });
-            });
-        } catch (e) { }
+        // Wire gossip membership events into the atlas so routing always has live data.
+        this.gossip.subscribe((id, record, event) => {
+            if (event === 'dead') {
+                if (this.atlas[id]) {
+                    this.atlas[id].status = 'offline';
+                    this.atlas[id].lastSeen = Date.now();
+                }
+            } else if (record) {
+                this.mergeAtlas({ [id]: record as unknown as AtlasEntry }, false, 0);
+                // Keep the consistent hash ring in sync
+                if (event === 'joined') this.ring.add(id);
+            }
+            if (event === 'dead') this.ring.remove(id);
+        });
 
-        // --- 2. IMMORTAL RESURRECTION PING ---
-        // Every hour, check on dead cells to see if they came back
+        // Start SWIM probes + anti-entropy sync
+        this.gossip.start(this._gossipSend);
+
+        // --- IMMORTAL RESURRECTION PING ---
+        // Gossip handles failure detection; this resurrects cells that were offline
+        // and came back. We still probe them occasionally via SWIM, but an explicit
+        // hour-level check keeps the atlas clean.
         const resurrectionPing = setInterval(() => {
             const now = Date.now();
             const deadCells = Object.values(this.atlas).filter(e =>
-                e.status === 'offline' && (now - e.lastSeen > 3600000) // 1 hour
+                e.status === 'offline' && (now - e.lastSeen > 3600000)
             );
-
             if (deadCells.length > 0) {
-                // Pick one random dead cell and ping it
                 const target = deadCells[Math.floor(Math.random() * deadCells.length)];
-                fetch(`${target.addr}/atlas`, { method: "POST", signal: AbortSignal.timeout(1000) })
+                fetch(`${target.addr}/gossip/ping`, { signal: AbortSignal.timeout(1000) })
                     .catch(() => { });
             }
-        }, 60000); // Check once a minute
+        }, 60000);
         this.activeIntervals.push(resurrectionPing);
 
-        // Heartbeat: Update registry file every 5s to stay "alive"
+        // Heartbeat: refresh our own gossip entry every 5s
         const heartbeat = setInterval(() => this.registerToRegistry(), 5000);
         this.activeIntervals.push(heartbeat);
 
         this.log("INFO", `Sovereign Cell online @ ${this._addr}`);
         this.saveManifest();
+
+        process.on("SIGINT", async () => {
+            await this.handleShutdown();
+        });
+
+        process.on("SIGTERM", async () => {
+            await this.handleShutdown();
+        });
 
         // Burst announce to speed up test convergence
         const announce = () => {

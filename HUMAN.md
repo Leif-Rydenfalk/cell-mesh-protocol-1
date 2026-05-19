@@ -1,0 +1,3 @@
+HUMAN = SOURCE OF FUCKING TRUTH DO NOT FUCK WITH THIS AND LISTEN TO EVERY SINGLE WORD LIKE A LAW BOOK
+
+Reference implementations for cell mesh development frameworks to help create cells in a language agnostic and protocol agnostic cell environment. Work in progress. Always a work in progress. The point of cells is that each one is different - and with their difference comes more functionality and robustness for the mesh, infinite software agnostic architecture.
