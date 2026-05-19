@@ -1409,9 +1409,20 @@ export class RheoCell {
     }
 
     /**
+     * Opt-out for auto re-resolution. Cells that want full manual control
+     * (drain → exit, custom backoff, etc.) set this to false and handle
+     * everything in their onDependencyDeath hook.
+     *
+     * Also overridable via the RHEO_AUTO_RERESOLVE env var ("false" or "0").
+     */
+    public autoReresolveDeps: boolean = process.env.RHEO_AUTO_RERESOLVE !== "false"
+        && process.env.RHEO_AUTO_RERESOLVE !== "0";
+
+    /**
      * Fires when gossip declares a peer dead. Looks up any resolved deps
-     * backed by that peer and triggers their death hooks. Wired into
-     * gossip.subscribe by completeListenSetup; do not call directly.
+     * backed by that peer, fires their death hooks, and (unless opted out)
+     * kicks off re-resolution for just that dep. Wired into gossip.subscribe
+     * by completeListenSetup; do not call directly.
      */
     private _handleGossipDead(id: string): void {
         for (const [alias, resolved] of Object.entries(this.deps)) {
@@ -1419,15 +1430,130 @@ export class RheoCell {
             const hooks = this.dependencyDeathHooks.get(alias) ?? [];
             const prior = { ...resolved };
             // Remove from resolved set so cells don't accidentally keep routing
-            // to a dead instance. Cells can re-resolve via resolveDependencies()
-            // if they want auto-healing.
+            // to a dead instance while we re-resolve.
             delete this.deps[alias];
             for (const hook of hooks) {
                 Promise.resolve()
                     .then(() => hook(alias, prior))
                     .catch(e => this.log("WARN", `dependency-death hook for "${alias}" threw: ${e?.message ?? e}`));
             }
+
+            // Find the original declaration and kick off re-resolution.
+            // Done async so the gossip event loop isn't blocked. If the cell
+            // opted out via autoReresolveDeps=false, we stop after firing hooks.
+            if (!this.autoReresolveDeps) continue;
+            const decl = (this.sourceManifest?.dependencies ?? []).find(
+                d => (d.alias ?? defaultAlias(d.ref)) === alias,
+            );
+            if (!decl) continue;
+            this.log("INFO", `🔄 Auto-reresolving "${alias}" after dep death...`);
+            Promise.resolve()
+                .then(() => this._resolveOne(decl))
+                .catch(e => this.log("WARN", `Auto-reresolve for "${alias}" failed: ${e?.message ?? e}`));
         }
+    }
+
+    /**
+     * Resolve a single dependency declaration. Mutates this.deps[alias] on
+     * success and this.unresolvedDeps[alias] on failure. Used by both the
+     * initial bulk resolveDependencies() and the per-alias death recovery
+     * path.
+     */
+    private async _resolveOne(dep: CellDependencyDeclaration): Promise<void> {
+        const alias = dep.alias ?? defaultAlias(dep.ref);
+
+        let parsed;
+        try {
+            parsed = parseDependencyRef(dep.ref);
+        } catch (e: any) {
+            this.unresolvedDeps[alias] = {
+                alias, ref: dep.ref, version: dep.version,
+                reason: "no-match", detail: e?.message ?? String(e),
+            };
+            return;
+        }
+
+        if (parsed.kind === "local") {
+            if (process.env.RHEO_DEV_MODE !== "1") {
+                this.unresolvedDeps[alias] = {
+                    alias, ref: dep.ref, version: dep.version,
+                    reason: "local-on-remote",
+                    detail: "local: refs require RHEO_DEV_MODE=1",
+                };
+                return;
+            }
+            this.deps[alias] = {
+                alias, ref: dep.ref, id: alias, addr: parsed.target,
+                version: dep.version, source: "local",
+            };
+            delete this.unresolvedDeps[alias];
+            return;
+        }
+
+        // Atlas first.
+        const live = this.gossip.liveAtlas() as unknown as Record<string, AtlasEntry>;
+        const candidates = findCandidates(dep, live);
+        if (candidates.length > 0) {
+            const pick = candidates[0];
+            this.deps[alias] = {
+                alias, ref: dep.ref, id: pick.id, addr: pick.entry.addr,
+                version: pick.entry.repoVersion,
+                source: "reused",
+            };
+            delete this.unresolvedDeps[alias];
+            return;
+        }
+
+        // Fire-and-forget spawn request. The router picks the freshest spawner;
+        // if none exist, askMesh fails immediately and we fall through to wait.
+        this.askMesh(
+            "mesh.spawn",
+            { ref: dep.ref, version: dep.version, requestedBy: this.id },
+            {},
+            { maxWaitMs: 0 },
+        ).catch(() => { /* expected when no spawner present */ });
+
+        const maxWaitMs = Number(process.env.RHEO_DEP_RESOLVE_MS ?? 60000);
+        const appeared = await new Promise<{ id: string; entry: AtlasEntry } | null>(resolve => {
+            let settled = false;
+            const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                resolve(null);
+            }, maxWaitMs);
+
+            const recheck = () => {
+                if (settled) return;
+                const now = this.gossip.liveAtlas() as unknown as Record<string, AtlasEntry>;
+                const hits = findCandidates(dep, now);
+                if (hits.length > 0) {
+                    settled = true;
+                    clearTimeout(timer);
+                    resolve(hits[0]);
+                }
+            };
+
+            this.gossip.subscribe((_id, _record, event) => {
+                if (event === 'joined' || event === 'updated') recheck();
+            });
+            recheck();
+        });
+
+        if (appeared) {
+            this.deps[alias] = {
+                alias, ref: dep.ref, id: appeared.id, addr: appeared.entry.addr,
+                version: appeared.entry.repoVersion,
+                source: "spawned",
+            };
+            delete this.unresolvedDeps[alias];
+            return;
+        }
+
+        this.unresolvedDeps[alias] = {
+            alias, ref: dep.ref, version: dep.version,
+            reason: "spawn-timeout",
+            detail: `no live cell matched ${dep.ref} within ${maxWaitMs}ms`,
+        };
     }
 
     /**
@@ -1445,115 +1571,12 @@ export class RheoCell {
             return;
         }
 
-        const maxWaitMs = Number(process.env.RHEO_DEP_RESOLVE_MS ?? 60000);
-        const requiredFailures: string[] = [];
+        await Promise.all(deps.map(d => this._resolveOne(d)));
 
-        const resolveOne = async (dep: CellDependencyDeclaration): Promise<void> => {
-            const alias = dep.alias ?? defaultAlias(dep.ref);
-            let parsed;
-            try {
-                parsed = parseDependencyRef(dep.ref);
-            } catch (e: any) {
-                this.unresolvedDeps[alias] = {
-                    alias, ref: dep.ref, version: dep.version,
-                    reason: "no-match", detail: e?.message ?? String(e),
-                };
-                if (!dep.optional) requiredFailures.push(alias);
-                return;
-            }
-
-            if (parsed.kind === "local") {
-                if (process.env.RHEO_DEV_MODE !== "1") {
-                    this.unresolvedDeps[alias] = {
-                        alias, ref: dep.ref, version: dep.version,
-                        reason: "local-on-remote",
-                        detail: "local: refs require RHEO_DEV_MODE=1",
-                    };
-                    if (!dep.optional) requiredFailures.push(alias);
-                    return;
-                }
-                // In dev mode we don't run the dep — caller's responsibility.
-                this.deps[alias] = {
-                    alias, ref: dep.ref, id: alias, addr: parsed.target,
-                    version: dep.version, source: "local",
-                };
-                return;
-            }
-
-            // Try the live atlas first.
-            const live = this.gossip.liveAtlas() as unknown as Record<string, AtlasEntry>;
-            const candidates = findCandidates(dep, live);
-            if (candidates.length > 0) {
-                const pick = candidates[0];
-                this.deps[alias] = {
-                    alias, ref: dep.ref, id: pick.id, addr: pick.entry.addr,
-                    version: pick.entry.repoVersion,
-                    source: "reused",
-                };
-                return;
-            }
-
-            // Fire-and-forget spawn request. If no cell exposes mesh.spawn,
-            // this fails immediately with NOT_FOUND and we just wait for a
-            // matching cell to appear by some other means (manual start,
-            // future cell-spawner). The wait below is the actual blocking path.
-            this.askMesh(
-                "mesh.spawn",
-                { ref: dep.ref, version: dep.version, requestedBy: this.id },
-                {},
-                { maxWaitMs: 0 },
-            ).catch(() => { /* expected when no spawner present */ });
-
-            // Wait for a matching cell to appear via gossip.
-            const appeared = await new Promise<{ id: string; entry: AtlasEntry } | null>(resolve => {
-                let settled = false;
-                const timer = setTimeout(() => {
-                    if (settled) return;
-                    settled = true;
-                    resolve(null);
-                }, maxWaitMs);
-
-                const recheck = () => {
-                    if (settled) return;
-                    const now = this.gossip.liveAtlas() as unknown as Record<string, AtlasEntry>;
-                    const hits = findCandidates(dep, now);
-                    if (hits.length > 0) {
-                        settled = true;
-                        clearTimeout(timer);
-                        // Best-effort unsubscribe via no-op; gossip.subscribe has no off() today.
-                        resolve(hits[0]);
-                    }
-                };
-
-                // gossip.subscribe(cb) does not return an unsubscribe handle;
-                // we leave the callback bound for the cell's lifetime, which
-                // is fine because it short-circuits after `settled`.
-                this.gossip.subscribe((_id, _record, event) => {
-                    if (event === 'joined' || event === 'updated') recheck();
-                });
-                // One initial pass after subscription, in case the candidate
-                // appeared during the brief window above.
-                recheck();
-            });
-
-            if (appeared) {
-                this.deps[alias] = {
-                    alias, ref: dep.ref, id: appeared.id, addr: appeared.entry.addr,
-                    version: appeared.entry.repoVersion,
-                    source: "spawned",
-                };
-                return;
-            }
-
-            this.unresolvedDeps[alias] = {
-                alias, ref: dep.ref, version: dep.version,
-                reason: "spawn-timeout",
-                detail: `no live cell matched ${dep.ref} within ${maxWaitMs}ms`,
-            };
-            if (!dep.optional) requiredFailures.push(alias);
-        };
-
-        await Promise.all(deps.map(resolveOne));
+        const requiredFailures = deps
+            .filter(d => !d.optional)
+            .map(d => d.alias ?? defaultAlias(d.ref))
+            .filter(alias => this.unresolvedDeps[alias]);
 
         if (requiredFailures.length > 0) {
             this.log(

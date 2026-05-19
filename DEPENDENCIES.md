@@ -208,7 +208,7 @@ The **`github-registry` cell** retains a distinct purpose: it discovers cells th
 
 | Scenario | Behavior |
 |----------|----------|
-| Dep gossip-matched, then dep dies | Cell receives gossip `dead` event for the resolved id. Re-resolves against any other live instance. If none, emits new SpawnRequest. |
+| Dep gossip-matched, then dep dies | Cell receives gossip `dead` event for the resolved id. Death hooks fire. Unless the cell sets `autoReresolveDeps = false` (or `RHEO_AUTO_RERESOLVE=false`), the resolver automatically re-resolves the single dep — atlas first, then a fresh `mesh.spawn` request. The cell's `cell.deps[alias]` is temporarily absent during this window; consumers should re-check before each use rather than caching the addr. |
 | SpawnRequest times out (no spawner alive) | `optional` dep: cell starts without it. Required dep: cell logs fatal and exits. |
 | Two spawners both clone | Claim window deduplicates; loser drops. Worst case: one wasted clone, no duplicate live cell. |
 | `local:` ref reached a remote node | Resolver fails fast with an error directing the operator to publish a real repo. |
@@ -223,6 +223,7 @@ New environment variables:
 |-----|---------|---------|
 | `RHEO_DEV_MODE` | unset | Required to use `local:` refs. |
 | `RHEO_DEP_RESOLVE_MS` | `60000` | Max wait for dependency resolution before failing. |
+| `RHEO_AUTO_RERESOLVE` | `true` | Set to `false` (or `0`) to disable auto re-resolution when a dep dies. The death hook still fires; recovery is then the cell's responsibility. |
 | `SPAWN_CLAIM_WINDOW_MS` | `200` | Claim coordination window for spawners. |
 
 ## What changes in `core.ts`

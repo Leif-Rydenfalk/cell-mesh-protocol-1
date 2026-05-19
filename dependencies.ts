@@ -171,18 +171,114 @@ export type SpawnMessage =
 // Pure resolution helpers
 // ---------------------------------------------------------------------------
 
+interface ParsedSemver {
+    major: number;
+    minor: number;
+    patch: number;
+    pre?: string;
+}
+
+/**
+ * Parse a semver string into its components. Permissive about missing
+ * trailing numbers (`1`, `1.2` → fill zeros). Returns null on input that
+ * isn't recognisable as a version.
+ */
+function parseSemver(v: string): ParsedSemver | null {
+    const m = v.trim().match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?/);
+    if (!m) return null;
+    return {
+        major: parseInt(m[1], 10),
+        minor: m[2] ? parseInt(m[2], 10) : 0,
+        patch: m[3] ? parseInt(m[3], 10) : 0,
+        pre: m[4],
+    };
+}
+
+function cmpSemver(a: ParsedSemver, b: ParsedSemver): number {
+    if (a.major !== b.major) return a.major - b.major;
+    if (a.minor !== b.minor) return a.minor - b.minor;
+    if (a.patch !== b.patch) return a.patch - b.patch;
+    // Per spec, pre-release versions sort before the same version without.
+    if (a.pre === b.pre) return 0;
+    if (!a.pre) return 1;
+    if (!b.pre) return -1;
+    return a.pre < b.pre ? -1 : 1;
+}
+
+/**
+ * Test a single comparator (e.g. ">=1.2.3", "^1.0", "~2", "1.0.0") against
+ * a parsed version. Operators supported: `=` (default), `^`, `~`, `>=`,
+ * `<=`, `>`, `<`. Whitespace-tolerant.
+ */
+function matchComparator(version: ParsedSemver, comparator: string): boolean {
+    const trimmed = comparator.trim();
+    if (!trimmed || trimmed === "*") return true;
+
+    let op = "=";
+    let rest = trimmed;
+    for (const candidate of [">=", "<=", "^", "~", ">", "<", "="]) {
+        if (rest.startsWith(candidate)) {
+            op = candidate;
+            rest = rest.slice(candidate.length).trim();
+            break;
+        }
+    }
+
+    const target = parseSemver(rest);
+    if (!target) return false;
+
+    switch (op) {
+        case "=":  return cmpSemver(version, target) === 0;
+        case ">":  return cmpSemver(version, target) > 0;
+        case "<":  return cmpSemver(version, target) < 0;
+        case ">=": return cmpSemver(version, target) >= 0;
+        case "<=": return cmpSemver(version, target) <= 0;
+        case "^": {
+            // Caret: compatible with target up to next major (or next minor
+            // when major is 0, or next patch when both major+minor are 0).
+            if (cmpSemver(version, target) < 0) return false;
+            if (target.major > 0) return version.major === target.major;
+            if (target.minor > 0) return version.major === 0 && version.minor === target.minor;
+            return version.major === 0 && version.minor === 0 && version.patch === target.patch;
+        }
+        case "~": {
+            // Tilde: allow patch-level changes within the specified minor.
+            if (cmpSemver(version, target) < 0) return false;
+            return version.major === target.major && version.minor === target.minor;
+        }
+        default:
+            return false;
+    }
+}
+
 /**
  * Does `version` satisfy `range`?
  *
- * Initial draft uses minimal semver: "*" matches anything; an exact version
- * string matches itself. A real implementation should plug in `semver.satisfies`
- * but we keep this dependency-free for now to avoid bloating the protocol pkg.
+ * Supports the common range operators (`^`, `~`, `>=`, `<=`, `>`, `<`, `=`),
+ * exact match, `*` (any), and comma- or space-separated AND-conjunctions
+ * (`">=1.0.0 <2.0.0"`). No `||` OR-conjunctions — keep it on the wire only
+ * if you actually need them; almost all real-world ranges work without.
+ *
+ * Implemented inline to avoid adding a runtime dependency to the protocol
+ * package. Not as feature-complete as node-semver, but covers >95% of what
+ * Cell.toml authors will ever write.
  */
 export function satisfiesVersion(version: string | undefined, range: string | undefined): boolean {
     if (!range || range === "*") return true;
     if (!version) return false;
-    // TODO: replace with full semver range matching when integrated.
-    return version === range;
+
+    const parsedVersion = parseSemver(version);
+    if (!parsedVersion) {
+        // Fallback to exact string match for non-semver versions ("nightly", "v2-beta").
+        return version === range;
+    }
+
+    // AND-conjunction: every comparator must match.
+    const comparators = range.split(/[\s,]+/).filter(Boolean);
+    for (const c of comparators) {
+        if (!matchComparator(parsedVersion, c)) return false;
+    }
+    return true;
 }
 
 /**
