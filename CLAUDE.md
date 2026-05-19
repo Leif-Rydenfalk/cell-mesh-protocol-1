@@ -8,14 +8,14 @@ This is the core runtime library for the OpenJaws cell mesh. Every cell imports 
 
 ```bash
 # With the mesh running (or at least registry + log cells):
-cd mesh1/mesh-test
+cd mesh1/cell-mesh-protocol-1-test
 bun install
 bun run index.ts
 ```
 
-Check `mesh1/mesh-test/test-results/latest.log`. The `STATUS` line at the bottom must read `OK`. Any `[FAIL]` line is a regression you need to fix before committing.
+Check `mesh1/cell-mesh-protocol-1-test/test-results/latest.log`. The `STATUS` line at the bottom must read `OK`. Any `[FAIL]` line is a regression you need to fix before committing.
 
-Full test documentation: [`mesh1/mesh-test/TESTS.md`](../../mesh1/mesh-test/TESTS.md)
+Full test documentation: [`mesh1/cell-mesh-protocol-1-test/TESTS.md`](../../mesh1/cell-mesh-protocol-1-test/TESTS.md)
 
 | Change area | Tests to focus on |
 |-------------|------------------|

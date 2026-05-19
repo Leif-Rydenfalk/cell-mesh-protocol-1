@@ -30,6 +30,46 @@ export const REGISTRY_DIR = process.env.RHEO_REGISTRY_DIR || join(homedir(), ".r
 if (!existsSync(REGISTRY_DIR)) mkdirSync(REGISTRY_DIR, { recursive: true });
 
 // ============================================================================
+// HOST RESOLUTION
+// A cell's advertised host must reach back from the open internet, not just
+// from its own loopback. If RHEO_HOST is set, we trust it (operator override).
+// Otherwise we probe well-known metadata + echo endpoints. On failure we
+// default to localhost so dev still works. Side-effects process.env.RHEO_HOST
+// so all the downstream `process.env.RHEO_HOST || 'localhost'` reads see it.
+// ============================================================================
+
+let _hostResolutionPromise: Promise<string> | null = null;
+
+export async function resolveCellHost(): Promise<string> {
+    if (process.env.RHEO_HOST) return process.env.RHEO_HOST;
+    if (process.env.RHEO_NO_HOST_DETECT === '1') return 'localhost';
+    if (_hostResolutionPromise) return _hostResolutionPromise;
+
+    _hostResolutionPromise = (async () => {
+        const sources = [
+            "http://169.254.169.254/hetzner/v1/metadata/public-ipv4",
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://icanhazip.com",
+        ];
+        for (const url of sources) {
+            try {
+                const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+                if (!res.ok) continue;
+                const body = (await res.text()).trim();
+                if (/^\d+\.\d+\.\d+\.\d+$/.test(body) || /^[0-9a-f:]+$/i.test(body)) {
+                    process.env.RHEO_HOST = body;
+                    return body;
+                }
+            } catch { /* try next source */ }
+        }
+        return 'localhost';
+    })();
+
+    return _hostResolutionPromise;
+}
+
+// ============================================================================
 // CELL ADDRESS ABSTRACTION
 // Biological analogy: Like a cell's position in tissue — not just "localhost"
 // but a proper address in the extracellular matrix.
@@ -3362,6 +3402,12 @@ export class RheoCell {
  * and performs defensive entry-point checks before routing.
  */
     public async listen() {
+        // Resolve our public-facing host BEFORE any addr is constructed. If
+        // RHEO_HOST is unset we probe metadata/echo endpoints. Without this,
+        // every downstream `process.env.RHEO_HOST || 'localhost'` would
+        // fall back to localhost on cloud VMs and break gossip routing.
+        await resolveCellHost();
+
         // === GHOST BUSTER (Dead-Man's Switch) ===
         // Voluntary Dead-Man's Switch: If spawned by a parent, we MAY choose to
         // shut down if the parent disappears. But it's OUR choice — sovereignty.
