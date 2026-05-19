@@ -1312,6 +1312,17 @@ export class RheoCell {
 
     private isShuttingDown: boolean = false;
     private activeIntervals: Timer[] = [];
+    private cleanupHooks: Array<() => void | Promise<void>> = [];
+
+    /** Register a setInterval handle to be cleared on cell shutdown. */
+    public registerInterval(interval: Timer): void {
+        this.activeIntervals.push(interval);
+    }
+
+    /** Register a cleanup function to be called during cell shutdown. */
+    public onShutdown(fn: () => void | Promise<void>): void {
+        this.cleanupHooks.push(fn);
+    }
 
     private activeExecutions = new Map<string, Promise<TraceResult>>();
     private resultCache = new Map<string, { result: TraceResult, time: number }>();
@@ -2171,6 +2182,7 @@ export class RheoCell {
         PortRegistry.releasePort(this.id);
         this.markOfflineInRegistry();
         this.activeIntervals.forEach(clearInterval);
+        this.activeIntervals.length = 0;
         this.log("WARN", "Extinguishing cell...");
 
         // === PHASE 1: ABORT ALL OUTBOUND FETCHES ===
@@ -2181,6 +2193,18 @@ export class RheoCell {
             for (const [id, ctrl] of this.activeControllers) {
                 ctrl.abort();
             }
+        }
+
+        // Wake all suspended askMesh discovery-waits so they fail fast instead
+        // of blocking drain for the full maxWaitMs (default 30s).
+        for (const waiters of this.capabilityWaiters.values()) {
+            for (const wakeup of waiters) wakeup();
+        }
+        this.capabilityWaiters.clear();
+
+        // Run cell-level cleanup hooks (stop external servers, flush state, etc.)
+        if (this.cleanupHooks.length > 0) {
+            await Promise.allSettled(this.cleanupHooks.map(fn => fn()));
         }
 
         // === PHASE 2: WAIT FOR IN-FLIGHT HANDLERS ===
@@ -3565,10 +3589,12 @@ export class RheoCell {
 
         process.on("SIGINT", async () => {
             await this.handleShutdown();
+            process.exit(0);
         });
 
         process.on("SIGTERM", async () => {
             await this.handleShutdown();
+            process.exit(0);
         });
 
         // Burst announce to speed up test convergence
